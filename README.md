@@ -8,6 +8,7 @@ original studio album are both in your library).
 
 Tested with a ~24,000 track FLAC/MP3/M4A library on a USB drive attached to
 Volumio 3.
+May also work on Volumio 4 - but NOT tested.
 
 ## What it does
 
