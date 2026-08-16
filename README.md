@@ -8,7 +8,6 @@ original studio album are both in your library).
 
 Tested with a ~24,000 track FLAC/MP3/M4A library on a USB drive attached to
 Volumio 3.
-May also work on Volumio 4 - but NOT tested.
 
 ## What it does
 
@@ -197,11 +196,32 @@ The script also writes its own log (with timestamps) to
 `$MUSIC_DIR/Playlists/smart_playlists.debug.log` on every run, independent
 of `DEBUG`.
 
-### Running on a schedule (cron)
+### Running on a schedule
 
+You don't strictly need cron - Volumio uses systemd as its init system, so
+systemd timers work too and don't require installing anything extra. Pick
+whichever you're more comfortable with.
+
+**Option A: cron**
+
+Cron is usually already present on Volumio (it's Debian-based), but the
+cron *service* is sometimes not enabled to start on boot - there are
+several reports of this in the Volumio community. Check first:
+```bash
+crontab -l
+systemctl status cron
+```
+If cron is present but not running/enabled:
+```bash
+sudo systemctl enable --now cron
+```
+Only if `cron`/`crontab` is genuinely missing:
 ```bash
 sudo apt-get install -y cron
-sudo systemctl enable --now cron
+```
+
+Then edit the system crontab:
+```bash
 sudo nano /etc/crontab
 ```
 Add (daily at 3 AM):
@@ -213,6 +233,52 @@ If `exiftool` or `jq` live outside the default cron `PATH`, add a `PATH=`
 line above your entry in `/etc/crontab`:
 ```
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+**Option B: systemd timer**
+
+No extra package needed, integrates with `journalctl` for logging, and -
+unlike cron - can catch up on a missed run (e.g. if Volumio was off at
+3 AM) instead of just skipping it.
+
+```bash
+sudo nano /etc/systemd/system/smart-playlists.service
+```
+```ini
+[Unit]
+Description=Volumio Smart Playlists
+
+[Service]
+Type=oneshot
+User=volumio
+ExecStart=/usr/local/bin/volumio-smart-playlists.sh
+```
+
+```bash
+sudo nano /etc/systemd/system/smart-playlists.timer
+```
+```ini
+[Unit]
+Description=Run Volumio Smart Playlists daily at 3 AM
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now smart-playlists.timer
+```
+
+Check logging and next scheduled run:
+```bash
+journalctl -u smart-playlists.service
+systemctl list-timers smart-playlists.timer
 ```
 
 ## How it stores playlists
@@ -257,6 +323,14 @@ Volumio immediately, no import step required.
 - Album art is not explicitly set in the generated JSON; Volumio typically
   resolves it automatically from the `uri` during playback.
 
+## Upgrading from an earlier version
+
+If you're upgrading from a version of this script that used
+`build_artist_playlists.sh` / `artists_playlists.txt` / `.track_cache.tsv`:
+rename your existing input file to `smart_playlists.txt`, and either rename
+your existing `.track_cache.tsv` to `.smart_playlists_cache.tsv` (to keep
+the incremental cache and avoid a full rescan) or just let the script
+rebuild it from scratch on the next run.
 
 ## License
 
