@@ -45,6 +45,14 @@ DEBUG_LOG="$WORK_DIR/smart_playlists.debug.log"
 mkdir -p "$WORK_DIR"
 mkdir -p "$PLAYLIST_OUT_DIR"
 
+# Rudimentary log rotation: keep the debug log from growing unbounded
+# under a long-lived daily cron/systemd-timer schedule - relevant on
+# space-constrained SD-card Volumio installs. Rotate once it exceeds
+# ~5 MB, keeping one previous copy.
+if [[ -f "$DEBUG_LOG" ]] && (( $(stat -c%s "$DEBUG_LOG" 2>/dev/null || echo 0) > 5242880 )); then
+  mv -f "$DEBUG_LOG" "${DEBUG_LOG}.1"
+fi
+
 exec 3>>"$DEBUG_LOG"
 PS4='+ ${BASH_SOURCE}:${LINENO}:${FUNCNAME[0]:-main}: '
 if [[ "${DEBUG:-0}" == "1" ]]; then
@@ -307,6 +315,16 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   else
     base="$(sanitize_name "${rest//;/, }")"
   fi
+
+  # "." or ".." (the only path-traversal-relevant names sanitize_name
+  # doesn't already neutralize, since it strips "/" but not dots) would
+  # resolve to PLAYLIST_OUT_DIR itself or its parent - refuse rather than
+  # let a later write/rm target land outside the playlist directory.
+  if [[ "$base" == "." || "$base" == ".." ]]; then
+    log "Skipping line with unsafe playlist name ('$base'): $line"
+    continue
+  fi
+
   [[ -n "$base" ]] && current_names+=("$base")
 
   # Line format (after the optional name prefix): "Artist1;Artist2;...|field<op>value|field<op>value|..."
@@ -621,20 +639,34 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       ordered_tracks="$limited_tracks"
     fi
 
-    cat "$ordered_tracks" \
-      | while IFS=$'\t' read -r fp ti al aa trk yr added; do
-          rel="${fp#"$MPD_ROOT"/}"
-          uri="music-library/${MPD_SOURCE_LABEL}/${rel}"
-          title="$ti"
-          [[ -z "$title" ]] && title="$(basename "$fp")"
-          jq -n --arg service "mpd" \
-                --arg uri "$uri" \
-                --arg title "$title" \
-                --arg artist "$aa" \
-                --arg album "$al" \
-                '{service:$service, uri:$uri, title:$title, artist:$artist, album:$album}'
-        done \
-      | jq -s '.' > "$outfile"
+    # Build the JSON array in one awk pass + one jq invocation instead of
+    # spawning a separate jq process per track. On large, lightly-filtered
+    # playlists (thousands of matches out of a 24k-track library) the old
+    # per-track subprocess loop was by far the slowest part of the script -
+    # same reasoning as the single-awk-pass artist matching above.
+    playlist_tsv="$TMP_ROOT/playlist_$$_${RANDOM}.tsv"
+    awk -F'\t' -v mpdroot="$MPD_ROOT" -v label="$MPD_SOURCE_LABEL" '
+      BEGIN { OFS = "\t"; rootprefix = mpdroot "/" }
+      {
+        fp = $1; ti = $2; al = $3; aa = $4
+        rel = fp
+        if (substr(fp, 1, length(rootprefix)) == rootprefix) {
+          rel = substr(fp, length(rootprefix) + 1)
+        }
+        uri = "music-library/" label "/" rel
+        title = ti
+        if (title == "") {
+          n = split(fp, parts, "/")
+          title = parts[n]
+        }
+        print uri, title, aa, al
+      }
+    ' "$ordered_tracks" > "$playlist_tsv"
+
+    jq -R -s '
+      split("\n") | map(select(length > 0) | split("\t")) |
+      map({service: "mpd", uri: .[0], title: .[1], artist: .[2], album: .[3]})
+    ' "$playlist_tsv" > "$outfile"
 
     chown volumio:volumio "$outfile" 2>/dev/null || true
 
