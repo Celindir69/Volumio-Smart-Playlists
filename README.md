@@ -1,24 +1,34 @@
 # Volumio Smart Playlists
 
-A bash script for Volumio 3 that automatically builds native Volumio playlists
-from a plain text file of rules - artist lists with optional AND/OR filters on
-album, genre, year, title, track number, duration, and BPM, plus optional
-deduplication of repeated tracks (e.g. when a best-of/live compilation and the
-original studio album are both in your library).
+A bash script for Volumio 3 that automatically builds native Volumio
+playlists from a plain text file of rules - artist lists with optional
+AND/OR filters on album, genre, year, title, track number, duration, and
+days-since-added, plus custom sort order, track limits, and deduplication
+(e.g. when a best-of/live compilation and the original studio album are
+both in your library).
 
-Tested with a ~24,000 track FLAC/MP3/M4A library on a USB drive attached to
-Volumio 3.
+Tested with a ~25,000 track FLAC/MP3/M4A/DSF/OGG library spread across
+Internal Storage, a USB drive, and a NAS share on Volumio 3.
+
+Also available as a Volumio plugin (settings page in the Volumio UI, no
+SSH needed for day-to-day use) - see
+[smart-playlist-plugin](https://github.com/Celindir69/smart-playlist-plugin),
+which wraps this exact same script.
 
 ## What it does
 
 - Reads a text file where each line describes one playlist you want built
   (artist name(s), optionally with filters).
+- **Scans all of Volumio's standard music sources automatically** - Internal
+  Storage, USB, and NAS - no path configuration needed. A source that isn't
+  present on your system (e.g. no NAS connected) is silently skipped.
 - Reads metadata (AlbumArtist, Artist, Title, Album, Genre, Year, Track,
-  Duration, BPM) from your music files via `exiftool`, with an **incremental
-  cache**: only new or changed files are re-scanned on subsequent runs, so a
-  library of tens of thousands of tracks that would take ~20 minutes to scan
-  the first time only takes seconds on later runs if just a handful of files
-  changed.
+  Duration) directly from **Volumio's own MPD database** via `mpc` - the
+  same index that powers Browse/Search, so there's no separate per-file
+  scan to wait for at all (a ~24k track library that used to take ~20
+  minutes on first run with a per-file tag scanner now takes a couple of
+  seconds, every run). Requires a correctly installed Volumio with a
+  reachable local MPD - see "How metadata is read" below.
 - Supports `.flac`, `.mp3`, `.m4a`, `.dsf`, `.ogg`, `.opus`, `.aiff`/`.aif`,
   and `.ape` out of the box - configurable via the `AUDIO_EXTENSIONS` array
   in the script (see "Notes / limitations" below for why `.wav`/`.wma`
@@ -31,45 +41,83 @@ Volumio 3.
 
 ## Requirements
 
-- Volumio 3
-- `exiftool` and `jq` installed:
+- Volumio 3, with a reachable local MPD (standard on any correctly
+  installed Volumio)
+- `jq` and `mpc`. `mpc` is part of Volumio's base image - nothing to
+  install.
   ```bash
   sudo apt-get update
-  sudo apt-get install -y libimage-exiftool-perl jq
+  sudo apt-get install -y jq
   ```
 
 ## Installation
 
-1. Download `volumio-smart-playlists.sh` and copy it to your Volumio device,
-   e.g. `/usr/local/bin/volumio-smart-playlists.sh`.
+1. Download `volumio-smart-playlists.sh` and copy it to your Volumio
+   device, e.g. `/usr/local/bin/volumio-smart-playlists.sh`.
 2. Make it executable:
    ```bash
    sudo chmod +x /usr/local/bin/volumio-smart-playlists.sh
    ```
-3. **Edit the configuration block at the top of the script** to match your
-   setup:
-   ```bash
-   MUSIC_DIR="/media/MX-Media"      # your music folder
-   MPD_ROOT="/media"                # the mount root Volumio/MPD sees
-   MPD_SOURCE_LABEL="USB"           # the source label Volumio shows in Browse
-   ```
-   To find the right values for your system:
-   - `MUSIC_DIR` is wherever your music actually lives - check with
-     `mount` or `df -h` on your Volumio device (USB drives are commonly
-     mounted under `/media/<label>`, network shares under `/mnt/<label>`).
-   - `MPD_ROOT` is the parent directory Volumio treats as its music root
-     (usually `/media` or `/mnt`, one level above your music folder).
-   - `MPD_SOURCE_LABEL` is the name Volumio uses internally for this
-     source. The easiest way to find it: create *any* playlist manually in
-     the Volumio UI, then inspect the resulting file under
-     `/data/playlist/` - the `uri` field looks like
-     `music-library/<SOURCE_LABEL>/<path>/track.flac`. Whatever comes
-     right after `music-library/` is your `MPD_SOURCE_LABEL`.
+3. That's it - no path configuration needed, it reads Internal Storage,
+   USB, and NAS metadata straight from Volumio's own MPD (see "How
+   metadata is read" below if your setup is non-standard).
+
+## Where it stores its data
+
+Rules, the metadata cache, the cleanup manifest, and the debug log all live
+under `/data/smart_playlists_data/` by default - deliberately **not**
+inside your music folder (so you won't accidentally edit/delete it while
+browsing your music share). Override the location via the
+`SMART_PLAYLISTS_WORK_DIR` environment variable if you'd rather keep it
+elsewhere.
+
+## How metadata is read
+
+All metadata comes from Volumio's own MPD instance (`mpc search any ""`)
+rather than from scanning files one by one - MPD already has the whole
+library indexed for Browse/Search, so this is both far faster and one less
+thing to keep in sync. This needs no configuration, and requires a
+reachable local MPD; if `mpc` is missing or MPD doesn't respond, the script
+exits with a clear error rather than guessing at an alternative (on a
+correctly installed Volumio, MPD is always there).
+
+What this means in practice:
+- **Artist, Album, Title, Genre, Year, Track, Duration**: come from MPD.
+  No incremental cache is needed for these - a single MPD query is fast
+  enough to just re-run in full on every invocation.
+- **`added`** (days since added): MPD doesn't track "date added", so it
+  still comes from the file's filesystem mtime via a plain `find` pass -
+  just listing files and their timestamps, fast regardless of library
+  size.
+- **uri source mapping**: MPD reports each file's path relative to its own
+  `music_directory` (default `/var/lib/mpd/music`), prefixed with the same
+  source label Volumio itself uses for each of its standard music sources
+  (Internal Storage, USB, NAS) - e.g. `INTERNAL/Artist/Album/Track.mp3`.
+  That label is mapped to a playlist `uri` prefix via
+  `SMART_PLAYLISTS_URI_PREFIXES` (newline-separated `label|uri_prefix`
+  entries, default:
+  ```
+  INTERNAL|music-library/
+  USB|music-library/
+  NAS|mnt/
+  ```
+  ). **INTERNAL and USB are verified against a real device; NAS is
+  UNVERIFIED** (no NAS source was available to test against) - if you use
+  a NAS source, check the debug log for a "no configured uri prefix"
+  warning and adjust `SMART_PLAYLISTS_URI_PREFIXES` if needed.
+
+Relevant environment variables:
+- `SMART_PLAYLISTS_MPD_MUSIC_DIR` - MPD's `music_directory` (default
+  `/var/lib/mpd/music`; check `grep music_directory /etc/mpd.conf` if
+  unsure).
+- `SMART_PLAYLISTS_MPD_TIMEOUT` - seconds to wait for an MPD query before
+  giving up (default `120`).
+- `SMART_PLAYLISTS_URI_PREFIXES` - see above.
 
 ## Input file format
 
-Create `Playlists/smart_playlists.txt` inside your music folder (i.e.
-`$MUSIC_DIR/Playlists/smart_playlists.txt`). One line per playlist:
+Create `smart_playlists.txt` inside `/data/smart_playlists_data/` (or
+wherever `SMART_PLAYLISTS_WORK_DIR` points). One line per playlist:
 
 ```
 [Playlist Name::]Artist1;Artist2;Artist3[|field<op>value[,field<op>value...]|...][|duplicate=true|false]
@@ -110,12 +158,12 @@ is exactly equivalent to the more compact
   (AND of ORs), which covers the vast majority of real-world queries
   without needing full parenthesized boolean expressions.
   - Fields: `album`, `genre`, `year`, `title`, `artist`, `track`,
-    `duration` (seconds), `bpm`, `added` (days since the file's mtime -
-    see caveat below)
+    `duration` (seconds), `added` (days since the file's mtime - see
+    caveat below)
   - Operators: `=`, `!=`, `~` (contains), `!~` (does not contain), `>`,
     `>=`, `<`, `<=`
   - Numeric comparisons (`>`, `>=`, `<`, `<=`) apply to `year`, `track`,
-    `duration`, `bpm`, and `added`.
+    `duration`, and `added`.
   - Note: if a value legitimately contains a comma, it will be
     mis-parsed as an OR split - this is a known limitation.
 - **`duplicate=false`** (optional, special field, must be its own `|`
@@ -164,8 +212,8 @@ Simply Red Mixes::Simply Red|title~Mix,album=12'' Ers
 # but each song should only appear once
 Queen Best-Of::Queen|duplicate=false
 
-# Fast, long tracks
-Long Uptempo::Genesis|duration>300|bpm>=120
+# Long tracks only
+Long Tracks::Genesis|duration>300
 
 # Sorted instead of shuffled: group by album (Z-A), tracks in order (1-N)
 Genesis Albums In Order::Genesis|sort=album-track+
@@ -173,8 +221,14 @@ Genesis Albums In Order::Genesis|sort=album-track+
 # Recently added tracks (based on file mtime), newest 15 only
 New Genesis::Genesis|added<30|sort=added+|limit=15
 
-# Wildcard artist: library-wide, not tied to any specific artist
+# Wildcard artist: library-wide, not tied to any specific artist,
+# pulls from Internal Storage, USB, and NAS all at once
 Recently Added (All Artists)::*|added<5|limit=20
+
+# 30 random tracks from an artist: filters ALL matching tracks first,
+# shuffles that whole set, then keeps the first 30 - a true random
+# sample across the entire matching catalog, not just the first 30 found
+Depeche Mode Mix::Depeche Mode|limit=30
 
 # Combined: everything together
 70s Rock, No Live Duplicates::Genesis;Supertramp;Pink Floyd|album!~Live|year>=1973|year<=1979|duplicate=false
@@ -193,8 +247,11 @@ DEBUG=1 bash -x /usr/local/bin/volumio-smart-playlists.sh 2> /tmp/debug.log
 ```
 
 The script also writes its own log (with timestamps) to
-`$MUSIC_DIR/Playlists/smart_playlists.debug.log` on every run, independent
-of `DEBUG`.
+`/data/smart_playlists_data/smart_playlists.debug.log` on every run,
+independent of `DEBUG`. Follow it live during/after a run:
+```bash
+tail -f /data/smart_playlists_data/smart_playlists.debug.log
+```
 
 ### Running on a schedule
 
@@ -229,7 +286,7 @@ Add (daily at 3 AM):
 0 3 * * * volumio /usr/local/bin/volumio-smart-playlists.sh >> /home/volumio/cron_playlists.log 2>&1
 ```
 
-If `exiftool` or `jq` live outside the default cron `PATH`, add a `PATH=`
+If `mpc` or `jq` live outside the default cron `PATH`, add a `PATH=`
 line above your entry in `/etc/crontab`:
 ```
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -291,46 +348,67 @@ objects like:
 {"service":"mpd","uri":"music-library/USB/Artist/Album/Track.flac","title":"...","artist":"...","album":"..."}
 ```
 This script writes exactly that format directly, so playlists appear in
-Volumio immediately, no import step required.
+Volumio immediately, no import step required. See "How metadata is read"
+above for how the `uri` differs between Internal Storage/USB and NAS.
 
 ## Notes / limitations
 
 - Scanned extensions are configurable via the `AUDIO_EXTENSIONS` array
   near the top of the script. Default: `flac mp3 m4a dsf ogg opus aiff
-  aif ape` - formats with well-established, reliably read metadata via
-  exiftool (ID3 for mp3/dsf/aiff, Vorbis comments for flac/ogg/opus,
-  APEv2 for ape, MP4 atoms for m4a). `.wav` and `.wma` are deliberately
-  excluded by default - tagging conventions for those vary too much
-  (RIFF INFO vs. ID3 chunks for WAV, inconsistent ASF tag usage for WMA)
-  to trust blindly. If you want to add them (or anything else), test
-  first with `exiftool -AlbumArtist -Artist yourfile.ext` to confirm it
-  actually returns something sensible for your files.
+  aif ape`. This only gates which files get an mtime entry (for change
+  detection and the `added` filter) - metadata itself comes from MPD
+  regardless of extension, but a file with no matching mtime entry never
+  makes it into the cache. `.wav` and `.wma` are deliberately excluded by
+  default - tagging conventions for those vary too much (RIFF INFO vs.
+  ID3 chunks for WAV, inconsistent ASF tag usage for WMA) across encoders
+  to trust blindly. Add your own extensions here if needed.
 - `duplicate=false` deduplicates by title only (not artist+title), so two
   different artists with a coincidentally identical song title would
   collapse into one entry. For the intended use case (same artist,
   best-of vs. studio album) this is the desired behavior.
-- Year is read from `-Year`, falling back to `-Date`, falling back to
-  `-ContentCreateDate` (the QuickTime "©day" atom iTunes-tagged M4A files
-  often use instead) - in that order.
+- Year comes from MPD's `Date` tag - the first 4 consecutive digits found
+  in it, so both plain-year (`2023`) and full-date (`2023-01-01`) formats
+  work.
 - `added` is based on the file's mtime, not a real "date added to
   library" tag (no audio format reliably stores that). If you re-copy or
   re-tag a file later, its mtime - and therefore its `added` value -
-  resets.
+  resets. An unclean USB disconnect/remount can also shift mtimes on some
+  filesystems (exFAT via FUSE in particular), which shows up as every file
+  looking "changed" on the next run - a one-off cost, not a bug, and it
+  self-corrects after that run.
 - OR-grouping via `,` inside a filter segment does not support escaping a
   literal comma in a value.
 - The script does not delete tracks from the *audio library*, only manages
   the generated playlist files under `/data/playlist/`.
 - Album art is not explicitly set in the generated JSON; Volumio typically
   resolves it automatically from the `uri` during playback.
+- A disconnected/unreachable NAS share still counts as "available" if its
+  mount directory exists locally, even if empty - you won't get an error,
+  just 0 tracks from that source. Check `mount | grep cifs` and `dmesg` if
+  NAS tracks are unexpectedly missing.
 
 ## Upgrading from an earlier version
 
-If you're upgrading from a version of this script that used
-`build_artist_playlists.sh` / `artists_playlists.txt` / `.track_cache.tsv`:
-rename your existing input file to `smart_playlists.txt`, and either rename
-your existing `.track_cache.tsv` to `.smart_playlists_cache.tsv` (to keep
-the incremental cache and avoid a full rescan) or just let the script
-rebuild it from scratch on the next run.
+This script has gone through a few naming/location and architecture
+changes:
+- `build_artist_playlists.sh` / `artists_playlists.txt` / `.track_cache.tsv`
+  → renamed to `volumio-smart-playlists.sh` / `smart_playlists.txt` /
+  `.smart_playlists_cache.tsv`
+- Single-source config (`MUSIC_DIR`/`MPD_ROOT`/`MPD_SOURCE_LABEL`, working
+  files stored inside your music folder) → automatic multi-source scanning,
+  working files moved to `/data/smart_playlists_data/`
+- Per-file `exiftool` scanning with an incremental cache → metadata read
+  directly from Volumio's own MPD (see "How metadata is read" above);
+  `exiftool` is no longer a dependency at all. `bpm` is no longer a
+  supported filter field (MPD has no BPM tag).
+
+If you're on an old version, the cleanest path is to delete the old cache
+file (wherever it was) and let the current version rebuild it fresh in its
+new location - trying to migrate the old cache format isn't worth the
+effort. Your existing rules just need to be copied into the new
+`smart_playlists.txt` location. A `bpm` filter in an existing rule line is
+simply ignored going forward (logged as an unknown field) rather than
+causing an error.
 
 ## License
 

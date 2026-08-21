@@ -4,7 +4,7 @@
 #
 # Automatically builds native Volumio 3 playlists from a plain text file of
 # rules: artist list (OR), plus optional AND/OR filters on album, genre,
-# year, title, artist, track number, duration, and BPM, with optional
+# year, title, artist, track number, and duration, with optional
 # deduplication by title. See README.md for the full syntax reference.
 # =============================================================================
 set -euo pipefail
@@ -15,23 +15,46 @@ export LANG=C
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-MUSIC_DIR="/media/MX-Media"
-MPD_ROOT="/media"                     # Volumio/MPD music root
-MPD_SOURCE_LABEL="USB"                # Data source label Volumio uses for this drive in the browse view
-                                       # -> uri = "music-library/USB/<path relative to MPD_ROOT>"
-                                       # (verified against a playlist created by Volumio itself)
+# Metadata comes from Volumio's own MPD instance via "mpc" - MPD already
+# indexes the whole library (that's what powers Browse/Search), so there's
+# no separate per-file tag-reading pass needed at all. This requires a
+# correctly installed Volumio with a reachable local MPD ("mpc" is part of
+# Volumio's base image) - if MPD isn't reachable, the script exits with a
+# clear error rather than guessing at an alternative.
+#
+# One thing MPD does NOT provide: "date added". The "added" filter relies
+# on the filesystem mtime instead, via a plain "find" pass (fast, no
+# per-file tool invocation, independent of library size).
+MPD_MUSIC_DIR="${SMART_PLAYLISTS_MPD_MUSIC_DIR:-/var/lib/mpd/music}"
+MPD_TIMEOUT="${SMART_PLAYLISTS_MPD_TIMEOUT:-120}"   # seconds - bounds the worst case if mpc/MPD hangs
 
-WORK_DIR="/media/MX-Media/Playlists"          # Working directory (cache, log, input file)
-PLAYLIST_OUT_DIR="/data/playlist"             # THIS is where Volumio 3 expects its playlists (JSON, not .m3u!)
+# Maps the FIRST path segment MPD reports for a track (its "source label" -
+# confirmed via a real mpc query to be exactly the label Volumio itself
+# uses, e.g. "INTERNAL"/"USB", since Volumio's MPD music_directory is a
+# folder of per-source symlinks/mounts named after those labels) to the
+# prefix needed to build a Volumio playlist "uri". INTERNAL and USB are
+# verified against real mpc output plus the existing (independently
+# verified) uri scheme below. NAS is carried over UNVERIFIED from the
+# previous filesystem-scan implementation's comments - no NAS source was
+# available to test the MPD path against. If you use a NAS source and
+# playlist entries for it don't play, check the debug log for "no
+# configured uri prefix" warnings and adjust this accordingly.
+SMART_PLAYLISTS_URI_PREFIXES_DEFAULT="INTERNAL|music-library/
+USB|music-library/
+NAS|mnt/"
+URI_PREFIXES_RAW="${SMART_PLAYLISTS_URI_PREFIXES:-$SMART_PLAYLISTS_URI_PREFIXES_DEFAULT}"
 
-# File extensions to scan. Only formats with well-established, reliably
-# read metadata via exiftool are included by default (ID3 for mp3/dsf/aiff,
-# Vorbis comments for flac/ogg/opus, APEv2 for ape, MP4 atoms for m4a).
-# .wav and .wma are deliberately NOT included - tagging conventions for
-# those are inconsistent enough (RIFF INFO vs. ID3 chunks, ASF tags) that
-# results would be unreliable. Add your own extensions here if needed;
-# just make sure `exiftool -AlbumArtist -Artist yourfile.ext` actually
-# returns something sensible first.
+WORK_DIR="${SMART_PLAYLISTS_WORK_DIR:-/data/smart_playlists_data}"   # Working directory (cache, log, input file) - deliberately NOT tied to any one music source
+PLAYLIST_OUT_DIR="${SMART_PLAYLISTS_OUT_DIR:-/data/playlist}"        # THIS is where Volumio 3 expects its playlists (JSON, not .m3u!)
+
+# File extensions to include. This gates which files get an mtime entry
+# (via "find", for change detection and the "added" filter) - metadata
+# itself comes from MPD regardless of extension, but a file with no
+# matching mtime entry never makes it into the final cache. .wav and .wma
+# are deliberately NOT included by default - tagging conventions for those
+# are inconsistent enough (RIFF INFO vs. ID3 chunks, ASF tags) across
+# encoders that results would be unreliable. Add your own extensions here
+# if needed.
 AUDIO_EXTENSIONS=(flac mp3 m4a dsf ogg opus aiff aif ape)
 
 # NOTE: renamed from "artists_playlists.txt" now that the script does more
@@ -68,9 +91,12 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "Error: jq is required (sudo apt-get install -y jq)" >&2
   exit 1
 fi
-if ! command -v exiftool >/dev/null 2>&1; then
-  log "exiftool not found"
-  echo "Error: exiftool is required" >&2
+# "mpc" talks to Volumio's own MPD instance, which is where all metadata
+# comes from - it's part of Volumio's base image on a correctly installed
+# system, so this is a hard requirement rather than something to install.
+if ! command -v mpc >/dev/null 2>&1; then
+  log "mpc not found - this should be part of Volumio's base image"
+  echo "Error: mpc is required (talks to Volumio's own MPD instance)" >&2
   exit 1
 fi
 
@@ -85,43 +111,45 @@ normalize() {
     | tr -d ' -_.'
 }
 
-# Cache format (tab-separated, 10 columns):
-#   mtime  AlbumArtist  FilePath  Title  Album  Genre  Year  Track  Duration  BPM
-#
-# Incremental update:
-#   1. Determine the current file set (path + mtime) via find.
-#   2. Read the existing cache (path -> mtime + full line).
-#   3. Only files that are new OR whose mtime has changed are re-read
-#      via exiftool.
-#   4. Files that are in the cache but no longer exist are automatically
-#      dropped when the new cache is written.
-#
-# IMPORTANT: -f forces exiftool to print a column for EVERY tag
-# (placeholder "-" for a missing tag). Without -f, columns shift when
-# a tag is missing and the cache becomes unusable.
-#
-# Year: some formats (especially FLAC/Vorbis) only carry the year in
-# -Date rather than -Year. iTunes-tagged M4A files often carry it only
-# in -ContentCreateDate (the QuickTime "©day" atom). We query all three
-# and use the first 4-digit year found, in the order Year, Date,
-# ContentCreateDate.
-#
-# Track: ID3 (MP3) usually uses the "Track" tag, Vorbis/FLAC uses
-# "TrackNumber". We query both, take the first non-empty value, and
-# extract only the leading digits (the value is often formatted "3/12").
-#
-# BPM: both ID3 (MP3) and QuickTime/M4A (the iTunes "tmpo" atom) map to
-# exiftool's unified "BeatsPerMinute" tag. FLAC/Vorbis has no fixed
-# convention but often carries a raw "BPM" field. We query both and take
-# the first non-empty, numeric value.
-#
-# Duration: the Composite tag "Duration#" ("#" requests the raw seconds
-# value instead of a formatted time like "3:45"), works across formats.
-update_cache() {
-  log "Updating cache (incremental)..."
+# Parse URI_PREFIXES_RAW (see the MPD integration config block above) into
+# parallel arrays: URI_LABEL[i] is the first path segment MPD reports for
+# a source (e.g. "INTERNAL"), URI_PREFIX[i] is what to prepend to the
+# WHOLE MPD-relative path (including that segment) to get the final
+# Volumio playlist "uri".
+URI_LABEL=()
+URI_PREFIX=()
+while IFS='|' read -r lbl pfx; do
+  [[ -z "$lbl" ]] && continue
+  URI_LABEL+=("$lbl")
+  URI_PREFIX+=("$pfx")
+done <<< "$URI_PREFIXES_RAW"
 
-  # Build the "-iname '*.ext'" clauses dynamically from AUDIO_EXTENSIONS
-  # so extensions only need to be maintained in one place.
+# Cache format (tab-separated, 9 columns):
+#   mtime  AlbumArtist  FilePath  Title  Album  Genre  Year  Track  Duration
+#
+# Rebuilds CACHE_FILE entirely from MPD's own database on every run
+# instead of scanning files one by one. No incremental read/diff of a
+# previous CACHE_FILE happens here (or is needed): MPD's database is
+# already the persistent, incrementally-maintained source of truth, and a
+# single "mpc search any" round-trip is fast enough to just always re-run
+# in full. Only mtime (via a lightweight "find", for the "added" filter)
+# still needs any incremental handling of its own on the script's side.
+#
+# Exits the whole script with a clear error if MPD/mpc can't be used for
+# any reason - on a correctly installed Volumio, MPD is always there.
+update_cache() {
+  log "Updating cache via MPD..."
+
+  if [[ ! -d "$MPD_MUSIC_DIR" ]]; then
+    echo "Error: MPD_MUSIC_DIR '$MPD_MUSIC_DIR' does not exist" >&2
+    exit 1
+  fi
+
+  if ! timeout 10 mpc stats >/dev/null 2>&1; then
+    echo "Error: MPD is not reachable (mpc stats failed) - is it running?" >&2
+    exit 1
+  fi
+
   local find_name_args=()
   local ext
   for ext in "${AUDIO_EXTENSIONS[@]}"; do
@@ -131,133 +159,99 @@ update_cache() {
     find_name_args+=(-iname "*.${ext}")
   done
 
+  # "-L" follows the symlinks Volumio uses under music_directory to point
+  # at the real INTERNAL/USB/NAS locations - "%P" (GNU find) prints the
+  # path RELATIVE to the search root directly, which is exactly the same
+  # relative-path form ("INTERNAL/...", "USB/...") that mpc's %file%
+  # reports, so the two can be joined by path without any translation.
   declare -A cur_mtime=()
   local total=0
-  while IFS=$'\t' read -r mt fp; do
-    [[ -z "$fp" ]] && continue
-    cur_mtime["$fp"]="$mt"
+  while IFS=$'\t' read -r mt relp; do
+    [[ -z "$relp" ]] && continue
+    cur_mtime["$relp"]="${mt%%.*}"
     total=$((total + 1))
-  done < <(find "$MUSIC_DIR" -type f \( "${find_name_args[@]}" \) -printf '%T@\t%p\n')
+  done < <(find -L "$MPD_MUSIC_DIR" -type f \( "${find_name_args[@]}" \) ! -name '._*' -printf '%T@\t%P\n')
 
-  log "Audio files found: $total"
+  log "Audio files found (filesystem, for mtime/added only): $total"
 
-  declare -A cache_mtime=()
-  declare -A cache_full=()
-  if [[ -f "$CACHE_FILE" ]]; then
-    while IFS=$'\t' read -r mt aa fp ti al ge yr trk dur bpm; do
-      [[ -z "$fp" ]] && continue
-      cache_mtime["$fp"]="$mt"
-      cache_full["$fp"]="$mt"$'\t'"$aa"$'\t'"$fp"$'\t'"$ti"$'\t'"$al"$'\t'"$ge"$'\t'"$yr"$'\t'"$trk"$'\t'"$dur"$'\t'"$bpm"
-    done < "$CACHE_FILE"
+  if (( total == 0 )); then
+    echo "Error: no audio files found under MPD_MUSIC_DIR ('$MPD_MUSIC_DIR')" >&2
+    exit 1
   fi
 
-  local to_scan=()
-  local fp
-  for fp in "${!cur_mtime[@]}"; do
-    if [[ "${cache_mtime[$fp]:-}" != "${cur_mtime[$fp]}" ]]; then
-      to_scan+=("$fp")
-    fi
-  done
-
-  local new_count=${#to_scan[@]}
-  log "New/changed files: $new_count"
-
-  if (( new_count > 0 )); then
-    local exif_out="$TMP_ROOT/exif_out.tsv"
-    local exif_rc=0
-    # NOTE: exiftool exits with a non-zero status as soon as EVEN A
-    # SINGLE one of the files passed to it triggers a warning (corrupt/
-    # unknown tags, etc.) - practically unavoidable on large batches.
-    # Combined with "pipefail" this would otherwise mark the whole
-    # pipeline as failed and "set -e" would kill the script instantly
-    # and silently. That's why the exit code is deliberately caught
-    # here and only logged.
-    { printf '%s\0' "${to_scan[@]}" \
-        | xargs -0 -r exiftool -T -s3 -f -AlbumArtist -Artist -Title -Album -Genre -Year -Date -ContentCreateDate -Track -TrackNumber '-Duration#' -BeatsPerMinute -BPM -FilePath \
-        | awk -F '\t' 'BEGIN{OFS="\t"}
-            {
-              aa=$1; ar=$2; ti=$3; al=$4; ge=$5; yr=$6; da=$7; cc=$8;
-              tr1=$9; tr2=$10; dur=$11; bp1=$12; bp2=$13; fp=$14;
-              if (aa=="-" || aa=="") aa=ar;
-              if (aa=="-" || aa=="") next;
-              if (ti=="-") ti="";
-              if (al=="-") al="";
-              if (ge=="-") ge="";
-              if (yr=="-" || yr=="") {
-                if (match(da, /[0-9][0-9][0-9][0-9]/)) {
-                  yr = substr(da, RSTART, 4)
-                } else if (match(cc, /[0-9][0-9][0-9][0-9]/)) {
-                  # ContentCreateDate: the QuickTime "©day" atom that
-                  # iTunes-tagged M4A files use for the release year -
-                  # -Year/-Date often return nothing for these files.
-                  yr = substr(cc, RSTART, 4)
-                } else {
-                  yr = ""
-                }
-              } else if (match(yr, /[0-9][0-9][0-9][0-9]/)) {
-                yr = substr(yr, RSTART, 4)
-              } else {
-                yr = ""
-              }
-
-              # Track: "Track" (ID3) or "TrackNumber" (Vorbis/FLAC),
-              # sometimes formatted "3/12" - keep only the leading digits.
-              trkraw = (tr1 != "-" && tr1 != "") ? tr1 : tr2
-              if (trkraw == "-" || trkraw == "") {
-                trk = ""
-              } else if (match(trkraw, /^[0-9]+/)) {
-                trk = substr(trkraw, RSTART, RLENGTH)
-              } else {
-                trk = ""
-              }
-
-              # Duration: the "#" Composite tag gives raw seconds - round
-              # to whole seconds.
-              if (dur == "-" || dur == "") {
-                dur = ""
-              } else {
-                dur = sprintf("%d", dur + 0)
-              }
-
-              # BPM: "BeatsPerMinute" (ID3/QuickTime) or raw "BPM"
-              # (common on FLAC/Vorbis) - keep numeric values only.
-              bpraw = (bp1 != "-" && bp1 != "") ? bp1 : bp2
-              if (bpraw == "-" || bpraw == "") {
-                bpm = ""
-              } else if (match(bpraw, /^[0-9]+(\.[0-9]+)?/)) {
-                bpm = substr(bpraw, RSTART, RLENGTH)
-              } else {
-                bpm = ""
-              }
-
-              print fp, aa, ti, al, ge, yr, trk, dur, bpm
-            }' > "$exif_out"
-    } || exif_rc=$?
-    if (( exif_rc != 0 )); then
-      log "Warning: exiftool/awk pipeline reported exit code $exif_rc (likely a warning on a single file) - continuing anyway"
-    fi
-
-    while IFS=$'\t' read -r fp aa ti al ge yr trk dur bpm; do
-      [[ -z "$fp" ]] && continue
-      local mt="${cur_mtime[$fp]:-}"
-      [[ -z "$mt" ]] && continue
-      cache_full["$fp"]="$mt"$'\t'"$aa"$'\t'"$fp"$'\t'"$ti"$'\t'"$al"$'\t'"$ge"$'\t'"$yr"$'\t'"$trk"$'\t'"$dur"$'\t'"$bpm"
-    done < "$exif_out"
+  # Bulk-fetch metadata for the WHOLE library in a single mpc call.
+  # Field separator is \x1f (ASCII Unit Separator), NOT "|" - confirmed
+  # empirically that mpc's own format-string syntax treats "|" specially
+  # and silently swallows all output past the first tag on otherwise
+  # correctly-tagged files. \x1f can't realistically collide with real
+  # tag content and matches the separator convention already used
+  # elsewhere in this script for structured data passed to awk.
+  local mpd_raw="$TMP_ROOT/mpd_meta_raw.tsv"
+  local mpd_err="$TMP_ROOT/mpd_meta_err.log"
+  if ! timeout "$MPD_TIMEOUT" mpc -f $'%file%\x1f%albumartist%\x1f%artist%\x1f%title%\x1f%album%\x1f%genre%\x1f%date%\x1f%track%\x1f%time%' search any "" > "$mpd_raw" 2>"$mpd_err"; then
+    echo "Error: 'mpc search any' failed or timed out (${MPD_TIMEOUT}s): $(cat "$mpd_err" 2>/dev/null)" >&2
+    exit 1
   fi
+  if [[ ! -s "$mpd_raw" ]]; then
+    echo "Error: mpc returned no tracks at all (empty/not-yet-updated MPD database?)" >&2
+    exit 1
+  fi
+
+  # %time% comes back as "M:SS" (or "H:MM:SS" for long tracks), not raw
+  # seconds - parseTime() converts it. Missing tags are simply absent from
+  # mpc's output (empty field); mapped to "-" here for consistency with
+  # the rest of the cache/filter logic (a non-empty placeholder, since
+  # "IFS=$'\t' read" treats tab as IFS whitespace and collapses runs of
+  # empty/adjacent delimiters, which would misalign columns otherwise).
+  local mpd_parsed="$TMP_ROOT/mpd_meta_parsed.tsv"
+  awk -F'\x1f' -v OFS='\t' '
+    function parseTime(t,   n, parts, secs, i) {
+      if (t == "" || t == "-") return "-"
+      n = split(t, parts, ":")
+      if (n < 1) return "-"
+      secs = 0
+      for (i = 1; i <= n; i++) secs = secs * 60 + (parts[i] + 0)
+      return secs
+    }
+    {
+      fp = $1; aa = $2; ar = $3; ti = $4; al = $5; ge = $6; da = $7; trk = $8; tm = $9
+      if (aa == "") aa = ar
+      if (aa == "") aa = "-"
+      if (ti == "") ti = "-"
+      if (al == "") al = "-"
+      if (ge == "") ge = "-"
+      if (match(da, /[0-9][0-9][0-9][0-9]/)) { yr = substr(da, RSTART, 4) } else { yr = "-" }
+      if (match(trk, /^[0-9]+/)) { trk = substr(trk, RSTART, RLENGTH) } else { trk = "-" }
+      dur = parseTime(tm)
+      gsub(/[\t\n\r]/, " ", aa); gsub(/[\t\n\r]/, " ", ti); gsub(/[\t\n\r]/, " ", al); gsub(/[\t\n\r]/, " ", ge); gsub(/[\t\n\r]/, " ", fp)
+      print fp, aa, ti, al, ge, yr, trk, dur
+    }
+  ' "$mpd_raw" > "$mpd_parsed"
+
+  declare -A meta_by_path=()
+  while IFS=$'\t' read -r fp aa ti al ge yr trk dur; do
+    [[ -z "$fp" ]] && continue
+    meta_by_path["$fp"]="$aa"$'\t'"$ti"$'\t'"$al"$'\t'"$ge"$'\t'"$yr"$'\t'"$trk"$'\t'"$dur"
+  done < "$mpd_parsed"
 
   local new_cache_file="${CACHE_FILE}.new"
-  rm -f "$new_cache_file"
   : > "$new_cache_file"
-  for fp in "${!cur_mtime[@]}"; do
-    if [[ -n "${cache_full[$fp]:-}" ]]; then
-      printf '%s\n' "${cache_full[$fp]}" >> "$new_cache_file"
+  local relp aa ti al ge yr trk dur meta
+  for relp in "${!cur_mtime[@]}"; do
+    meta="${meta_by_path[$relp]:-}"
+    if [[ -n "$meta" ]]; then
+      IFS=$'\t' read -r aa ti al ge yr trk dur <<< "$meta"
+    else
+      aa="-"; ti="-"; al="-"; ge="-"; yr="-"; trk="-"; dur="-"
     fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${cur_mtime[$relp]}" "$aa" "$relp" "$ti" "$al" "$ge" "$yr" "$trk" "$dur" >> "$new_cache_file"
   done
   mv "$new_cache_file" "$CACHE_FILE"
 
   local final_count
   final_count=$(wc -l < "$CACHE_FILE" | tr -d ' ')
-  log "Cache updated: $final_count entries total, $new_count new/updated"
+  log "Cache rebuilt via MPD: $final_count entries"
 }
 
 sanitize_name() {
@@ -265,9 +259,26 @@ sanitize_name() {
   # are deliberately kept so filtered playlist names stay readable
   # (e.g. "Genesis, Supertramp, Pink Floyd|album!~Live|year>=1973").
   # Only genuinely problematic characters (/ : " \ ? *) are replaced.
-  printf '%s' "$1" \
+  local out
+  out="$(printf '%s' "$1" \
     | tr '/:"\\?*' '_' \
-    | sed 's/^ *//; s/ *$//; s/  */ /g'
+    | tr -d '\000-\037' \
+    | sed 's/^ *//; s/ *$//; s/  */ /g')"
+
+  # Guard against names that would be dangerous or invisible as files:
+  #   "." / ".."   - not creatable as regular files at all; writing to
+  #                  them would fail (or worse, be misinterpreted)
+  #   ".foo"       - a leading dot makes it a hidden file, so the playlist
+  #                  would silently not show up where expected
+  # Also guard against an empty result (e.g. a name consisting only of
+  # characters that all got stripped).
+  case "$out" in
+    "" ) out="unnamed" ;;
+    "." | ".." ) out="unnamed" ;;
+    .* ) out="_${out}" ;;
+  esac
+
+  printf '%s' "$out"
 }
 
 update_cache
@@ -281,6 +292,7 @@ cache_lines=$(wc -l < "$CACHE_FILE" | tr -d ' ')
 log "Cache lines available: $cache_lines"
 
 current_names=()
+declare -A seen_names=()
 
 while IFS= read -r line || [[ -n "$line" ]]; do
   line="${line%$'\r'}"
@@ -316,14 +328,15 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     base="$(sanitize_name "${rest//;/, }")"
   fi
 
-  # "." or ".." (the only path-traversal-relevant names sanitize_name
-  # doesn't already neutralize, since it strips "/" but not dots) would
-  # resolve to PLAYLIST_OUT_DIR itself or its parent - refuse rather than
-  # let a later write/rm target land outside the playlist directory.
-  if [[ "$base" == "." || "$base" == ".." ]]; then
-    log "Skipping line with unsafe playlist name ('$base'): $line"
-    continue
+  # Two rule lines resolving to the same playlist name would silently
+  # overwrite each other (last one wins), which is almost never intended
+  # and very confusing to debug. Note this can also happen with visibly
+  # DIFFERENT names, because sanitize_name maps several characters to
+  # "_" (e.g. "A/B" and "A:B" both become "A_B").
+  if [[ -n "$base" && -n "${seen_names[$base]:-}" ]]; then
+    log "Warning: playlist name '$base' is used by more than one rule line - the later line overwrites the earlier one (line: $line)"
   fi
+  [[ -n "$base" ]] && seen_names["$base"]=1
 
   [[ -n "$base" ]] && current_names+=("$base")
 
@@ -428,6 +441,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
     IFS=',' read -r -a subconds <<< "$filt"
     group_joined=""
+    group_total=0
+    group_negative=0
     for sub in "${subconds[@]}"; do
       sub="$(printf '%s' "$sub" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
       [[ -z "$sub" ]] && continue
@@ -436,9 +451,13 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         fop="${BASH_REMATCH[2]}"
         fval="$(printf '%s' "${BASH_REMATCH[3]}" | sed 's/[[:space:]]*$//')"
         case "$ffield" in
-          album|genre|year|title|artist|track|duration|bpm|added) ;;
+          album|genre|year|title|artist|track|duration|added) ;;
           *) log "Unknown filter field ignored: $ffield (line: $line)"; continue ;;
         esac
+        group_total=$((group_total + 1))
+        if [[ "$fop" == "!=" || "$fop" == "!~" ]]; then
+          group_negative=$((group_negative + 1))
+        fi
         entry="${ffield}"$'\x1d'"${fop}"$'\x1d'"${fval}"
         if [[ -n "$group_joined" ]]; then
           group_joined+=$'\x1c'"$entry"
@@ -449,6 +468,17 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         log "Invalid filter ignored: '$sub' (line: $line)"
       fi
     done
+
+    # Likely-mistake check: a comma-group ("OR") made up ENTIRELY of
+    # negative conditions (!=, !~) is almost never what was intended.
+    # E.g. "album!~Live,title!~Live" means "album isn't Live OR title
+    # isn't Live", which is true for nearly every track (De Morgan's
+    # law: to exclude tracks where EITHER field says "Live", you need
+    # AND, i.e. separate "|" segments: "|album!~Live|title!~Live").
+    # This only warns, it does not change behavior or block the line.
+    if (( group_total >= 2 && group_negative == group_total )); then
+      log "Warning: line '$line' - filter group '$filt' combines $group_total exclusions (!=/!~) with comma (OR/likely a mistake - excludes almost nothing). To exclude tracks matching ANY of these, use separate | segments (AND) instead, e.g. |field1!~val1|field2!~val2"
+    fi
 
     [[ -z "$group_joined" ]] && continue
     if [[ -n "$filters_joined" ]]; then
@@ -530,7 +560,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       }
       # Numeric comparison (year)
       function numMatch(val, op, want,   nvv, nwv) {
-        if (val == "") return 0
+        if (val == "" || val == "-") return 0
         nvv = val + 0; nwv = want + 0
         if (op == "=")  return (nvv == nwv)
         if (op == "!=") return (nvv != nwv)
@@ -541,11 +571,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         return 1
       }
       # Evaluate a single sub-condition against the appropriate field.
-      function evalCond(f, op, v, aa, ti, al, ge, yr, trk, dur, bpm, mt, now,   daysAgo) {
+      function evalCond(f, op, v, aa, ti, al, ge, yr, trk, dur, mt, now,   daysAgo) {
         if (f == "year")         return numMatch(yr, op, v)
         if (f == "track")        return numMatch(trk, op, v)
         if (f == "duration")     return numMatch(dur, op, v)
-        if (f == "bpm")          return numMatch(bpm, op, v)
         if (f == "album")        return textMatch(al, op, v)
         if (f == "genre")        return textMatch(ge, op, v)
         if (f == "title")        return textMatch(ti, op, v)
@@ -561,7 +590,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         return 1
       }
       {
-        mt = $1; aa = $2; fp = $3; ti = $4; al = $5; ge = $6; yr = $7; trk = $8; dur = $9; bpm = $10
+        mt = $1; aa = $2; fp = $3; ti = $4; al = $5; ge = $6; yr = $7; trk = $8; dur = $9
         if (allArtists != 1 && !(norm(aa) in wantedSet)) next
 
         # Each group is AND-combined with the others; within a group,
@@ -570,7 +599,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         for (gi = 1; gi <= numGroups; gi++) {
           groupOk = 0
           for (sj = 1; sj <= groupSize[gi]; sj++) {
-            if (evalCond(gField[gi, sj], gOp[gi, sj], gVal[gi, sj], aa, ti, al, ge, yr, trk, dur, bpm, mt, now)) {
+            if (evalCond(gField[gi, sj], gOp[gi, sj], gVal[gi, sj], aa, ti, al, ge, yr, trk, dur, mt, now)) {
               groupOk = 1
               break
             }
@@ -641,27 +670,54 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
     # Build the JSON array in one awk pass + one jq invocation instead of
     # spawning a separate jq process per track. On large, lightly-filtered
-    # playlists (thousands of matches out of a 24k-track library) the old
-    # per-track subprocess loop was by far the slowest part of the script -
-    # same reasoning as the single-awk-pass artist matching above.
+    # playlists (thousands of matches) the old per-track subprocess loop
+    # was by far the slowest part of the script - same reasoning as the
+    # single-awk-pass artist matching above.
     playlist_tsv="$TMP_ROOT/playlist_$$_${RANDOM}.tsv"
-    awk -F'\t' -v mpdroot="$MPD_ROOT" -v label="$MPD_SOURCE_LABEL" '
-      BEGIN { OFS = "\t"; rootprefix = mpdroot "/" }
+    uri_warn_log="$TMP_ROOT/uri_warn_$$_${RANDOM}.log"
+    awk -F'\t' -v uriprefixes="$URI_PREFIXES_RAW" '
+      BEGIN {
+        OFS = "\t"
+        nLbl = split(uriprefixes, lblLines, "\n")
+        for (i = 1; i <= nLbl; i++) {
+          if (lblLines[i] == "") continue
+          split(lblLines[i], lp, "|")
+          labelPrefix[lp[1]] = lp[2]
+          haveLabel[lp[1]] = 1
+        }
+      }
+      # fp is relative to MPD_MUSIC_DIR in the form "<LABEL>/<rest>" - look
+      # up the label (first path segment) and prepend its configured
+      # prefix to the WHOLE path (label included).
+      function uriFor(fp,   label) {
+        label = fp
+        sub(/\/.*/, "", label)
+        if (label in haveLabel) return labelPrefix[label] fp
+        print "Warning: no configured uri prefix for source label '\''" label "'\'' (path: " fp ") - using raw relative path as uri" > "/dev/stderr"
+        return fp
+      }
       {
         fp = $1; ti = $2; al = $3; aa = $4
-        rel = fp
-        if (substr(fp, 1, length(rootprefix)) == rootprefix) {
-          rel = substr(fp, length(rootprefix) + 1)
-        }
-        uri = "music-library/" label "/" rel
+        uri = uriFor(fp)
+        # "-" is our internal placeholder for "no value" (see the note in
+        # update_cache on why real empty fields are avoided) - map it back
+        # to something sensible instead of a literal dash.
         title = ti
-        if (title == "") {
-          n = split(fp, parts, "/")
-          title = parts[n]
+        if (title == "" || title == "-") {
+          n = split(fp, p, "/")
+          title = p[n]
         }
+        if (aa == "-") aa = ""
+        if (al == "-") al = ""
         print uri, title, aa, al
       }
-    ' "$ordered_tracks" > "$playlist_tsv"
+    ' "$ordered_tracks" > "$playlist_tsv" 2>"$uri_warn_log"
+
+    if [[ -s "$uri_warn_log" ]]; then
+      while IFS= read -r warn_line; do
+        log "$warn_line"
+      done < "$uri_warn_log"
+    fi
 
     jq -R -s '
       split("\n") | map(select(length > 0) | split("\t")) |
@@ -692,13 +748,33 @@ for n in "${current_names[@]}"; do
   new_manifest_set["$n"]=1
 done
 
+# Names we failed to delete stay tracked so cleanup is retried on the
+# next run (e.g. once a permission/ownership issue is fixed) instead of
+# being silently forgotten forever just because this run's manifest
+# rewrite happens unconditionally below.
+failed_removals=()
+
 if [[ -f "$MANIFEST_FILE" ]]; then
   while IFS= read -r old_name; do
     [[ -z "$old_name" ]] && continue
     if [[ -z "${new_manifest_set[$old_name]:-}" ]]; then
       if [[ -f "$PLAYLIST_OUT_DIR/$old_name" ]]; then
-        rm -f "$PLAYLIST_OUT_DIR/$old_name"
-        log "Removed orphaned playlist: $old_name"
+        # NOTE: "rm -f" only suppresses "file does not exist" errors -
+        # a genuine permission/ownership failure (e.g. after a plugin
+        # reinstall changes file ownership) still makes it exit non-zero
+        # and print an error. Under "set -e" that would silently kill
+        # the WHOLE script mid-cleanup (before the manifest gets
+        # rewritten and before any later lines get processed), which is
+        # far worse than a failed deletion on its own. The "|| true"
+        # guards against that; we then verify success ourselves below
+        # instead of trusting rm's exit status either way.
+        rm -f "$PLAYLIST_OUT_DIR/$old_name" 2>/dev/null || true
+        if [[ -f "$PLAYLIST_OUT_DIR/$old_name" ]]; then
+          log "Warning: failed to remove orphaned playlist '$old_name' (still present after rm -f - check file ownership/permissions on $PLAYLIST_OUT_DIR) - will retry next run"
+          failed_removals+=("$old_name")
+        else
+          log "Removed orphaned playlist: $old_name"
+        fi
       fi
     fi
   done < "$MANIFEST_FILE"
@@ -706,6 +782,9 @@ fi
 
 : > "$MANIFEST_FILE"
 for n in "${current_names[@]}"; do
+  printf '%s\n' "$n" >> "$MANIFEST_FILE"
+done
+for n in "${failed_removals[@]}"; do
   printf '%s\n' "$n" >> "$MANIFEST_FILE"
 done
 
