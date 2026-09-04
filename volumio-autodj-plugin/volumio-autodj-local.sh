@@ -114,7 +114,11 @@ normalize() {
 }
 
 urlencode() {
-  jq -rn --arg v "$1" '$v | @uri'
+  # NOT "-rn" combined - jq 1.4 (still the default "apt-get install jq"
+  # package on Debian Jessie, which some older Volumio images are based
+  # on) rejects bundled short options ("jq: Unknown option -rn") and
+  # needs them passed separately.
+  jq -r -n --arg v "$1" '$v | @uri'
 }
 
 # ---------------------------------------------------------------------------
