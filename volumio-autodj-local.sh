@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Volumio AutoDJ / Continuous Play
+# Volumio AutoDJ / Continuous Play - local (SSH) variant
 #
-# Runs on a SEPARATE device on the same network as Volumio (NOT on Volumio
-# itself - no SSH access to Volumio required). Watches Volumio's play queue
-# via its REST API; once it's about to run out, picks a similar artist to
-# the last queued track (via the Last.fm API), checks whether that artist
-# is present in the local library (via MPD, queried over the network), and
-# if so appends one random track by that artist to the end of the queue.
+# For users WHO DO have SSH access to Volumio: runs directly ON Volumio
+# itself, scheduled via cron or a systemd timer there (same pattern as
+# volumio-smart-playlists.sh - see its "Running on a schedule" section in
+# README.md). Watches Volumio's play queue via its REST API; once it's
+# about to run out, picks a similar artist to the last queued track (via
+# the Last.fm API), checks whether that artist is present in the local
+# library (via Volumio's own MPD), and if so appends one random track by
+# that artist to the end of the queue.
+#
+# This is the same idea as volumio-autodj.sh, but simplified for running
+# locally: no "nc"-based raw MPD protocol workaround is needed here. That
+# workaround exists in volumio-autodj.sh because an INDEPENDENTLY installed
+# mpc client (e.g. Homebrew's on macOS) can be a newer version than
+# Volumio's own bundled MPD supports, which breaks "mpc find"/"mpc search"
+# outright. Running Volumio's OWN bundled mpc against its OWN bundled MPD
+# (as this script does) never has that mismatch, so plain "mpc find"/
+# "mpc search" work fine - no "nc" dependency needed. If you don't have
+# SSH access to Volumio, use volumio-autodj.sh from a different device
+# instead.
 #
 # Intended to be run periodically (e.g. every 1-2 minutes) via cron or a
-# systemd timer ON THE DEVICE THIS SCRIPT RUNS ON - it does not loop or
-# schedule itself. Each invocation does at most one queue check and, if
-# needed, adds exactly one track.
+# systemd timer - it does not loop or schedule itself. Each invocation
+# does at most one queue check and, if needed, adds exactly one track.
 #
 # Simple repeat guard: the last HISTORY_SIZE artists that were added (or
 # used as a seed) are remembered in a small history file, and skipped when
 # picking a candidate, so the same artist isn't immediately re-picked over
-# and over.
+# and over - unless NONE of the current candidates survive the guard, in
+# which case it's overridden as a fallback (see step 4 below) rather than
+# leaving the queue to run dry.
 # =============================================================================
 set -euo pipefail
 
@@ -27,19 +41,10 @@ export LANG=C
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via environment variables)
 # ---------------------------------------------------------------------------
-VOLUMIO_HOST="${VOLUMIO_HOST:?Set VOLUMIO_HOST to the Volumio devices IP/hostname}"
+# Defaults to localhost since this script is meant to run ON Volumio.
+VOLUMIO_HOST="${VOLUMIO_HOST:-localhost}"
 VOLUMIO_PORT="${VOLUMIO_PORT:-3000}"
-
-# MPD is queried directly (not through Volumio's REST API, which has no
-# "does this artist exist locally / list their tracks" endpoint) to check
-# whether a similar-artist candidate is actually in your library and to
-# pick a track. Defaults to the same host as Volumio, since Volumio's own
-# MPD is normally what you want. Requires MPD to be reachable on the
-# network (not just localhost) - check `grep bind_to_address /etc/mpd.conf`
-# on Volumio if this fails to connect; that one setting still needs to be
-# changed on Volumio itself, but that's a one-time config edit, not what
-# this script (or its scheduling) needs SSH for on an ongoing basis.
-MPD_HOST="${MPD_HOST:-$VOLUMIO_HOST}"
+MPD_HOST="${MPD_HOST:-localhost}"
 MPD_PORT="${MPD_PORT:-6600}"
 
 LASTFM_API_KEY="${LASTFM_API_KEY:?Set LASTFM_API_KEY to a free Last.fm API key (https://www.last.fm/api/account/create)}"
@@ -59,18 +64,21 @@ HISTORY_SIZE="${HISTORY_SIZE:-15}"
 # Same idea as SMART_PLAYLISTS_URI_PREFIXES in volumio-smart-playlists.sh -
 # maps the first path segment MPD reports for a track to the prefix needed
 # to build a Volumio playlist/queue "uri". Kept independent (own env var)
-# since this script runs on a different machine and has no access to the
-# other script's config.
+# so this script's config doesn't collide with the other script's.
 AUTODJ_URI_PREFIXES_DEFAULT="INTERNAL|music-library/
 USB|music-library/
 NAS|mnt/"
 URI_PREFIXES_RAW="${AUTODJ_URI_PREFIXES:-$AUTODJ_URI_PREFIXES_DEFAULT}"
 
-STATE_DIR="${AUTODJ_STATE_DIR:-$HOME/.volumio-autodj}"
-HISTORY_FILE="$STATE_DIR/history.txt"
-DEBUG_LOG="$STATE_DIR/autodj.debug.log"
+# Deliberately under /data/, matching volumio-smart-playlists.sh's own
+# convention (not tied to the music folder, and not assuming a
+# conventional writable $HOME for whatever user this runs as via cron/
+# systemd).
+WORK_DIR="${AUTODJ_STATE_DIR:-/data/volumio_autodj_data}"
+HISTORY_FILE="$WORK_DIR/history.txt"
+DEBUG_LOG="$WORK_DIR/autodj.debug.log"
 
-mkdir -p "$STATE_DIR"
+mkdir -p "$WORK_DIR"
 
 if [[ -f "$DEBUG_LOG" ]] && (( $(stat -c%s "$DEBUG_LOG" 2>/dev/null || stat -f%z "$DEBUG_LOG" 2>/dev/null || echo 0) > 2097152 )); then
   mv -f "$DEBUG_LOG" "${DEBUG_LOG}.1"
@@ -80,7 +88,7 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$DEBUG_LOG" >&2
 }
 
-for tool in curl jq mpc nc; do
+for tool in curl jq mpc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Error: '$tool' is required but not found" >&2
     exit 1
@@ -136,7 +144,7 @@ history_add() {
 api_base="http://${VOLUMIO_HOST}:${VOLUMIO_PORT}/api/v1"
 
 state_json="$(curl -sf --max-time 10 "${api_base}/getstate")" || {
-  log "Could not reach Volumio's REST API at $api_base (getstate) - is VOLUMIO_HOST/VOLUMIO_PORT correct?"
+  log "Could not reach Volumio's REST API at $api_base (getstate)"
   exit 1
 }
 status="$(printf '%s' "$state_json" | jq -r '.status // empty')"
@@ -203,9 +211,10 @@ if [[ -n "$lastfm_error" ]]; then
   exit 1
 fi
 
-# "mapfile"/"readarray" needs bash 4.0+, which isn't a given on every
-# device this script might run on (e.g. macOS still ships bash 3.2 by
-# default) - a plain "while read" loop works on any bash version instead.
+# "mapfile"/"readarray" and "declare -A" both need bash 4.0+, which isn't a
+# safe assumption on Volumio's own bash across every device/image this
+# might run on - plain "while read" loops and parallel arrays (see
+# find_local_artist below) work on any bash version instead.
 candidates=()
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -228,13 +237,13 @@ while IFS= read -r line; do
 done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" list artist 2>>"$DEBUG_LOG")
 
 if (( ${#local_artists[@]} == 0 )); then
-  log "Could not read the local artist list from MPD ($MPD_HOST:$MPD_PORT) - is it reachable? (check bind_to_address in Volumio's mpd.conf)"
+  log "Could not read the local artist list from MPD ($MPD_HOST:$MPD_PORT) - is it running?"
   exit 1
 fi
 
-# Parallel arrays instead of "declare -A" (associative arrays also need
-# bash 4.0+, same as mapfile above) - normalized name in local_norm[i]
-# maps to the real, as-tagged name in local_real[i] at the same index.
+# Parallel arrays instead of "declare -A" - normalized name in
+# local_norm[i] maps to the real, as-tagged name in local_real[i] at the
+# same index.
 local_norm=()
 local_real=()
 for a in "${local_artists[@]}"; do
@@ -294,75 +303,25 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Pick one random track by that artist and build its Volumio queue uri.
 # ---------------------------------------------------------------------------
-# NOTE: this deliberately does NOT use "mpc find"/"mpc search". Newer mpc/
-# libmpdclient releases (e.g. Homebrew's on macOS) send a "tagtypes ..."
-# protocol negotiation command before running find/search, which requires
-# MPD protocol 0.21+ - Volumio's own (much older, heavily patched) bundled
-# MPD rejects it outright ("MPD error: wrong number of arguments for
-# 'tagtypes'"), so "mpc find"/"mpc search" fail completely against Volumio
-# whenever this script runs on a machine with a newer mpc than Volumio's
-# MPD supports, even for an artist that unmistakably IS in the library
-# (confirmed via "mpc list artist" just above). Same class of bug reported
-# here for another MPD-protocol server:
-# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1002544
-#
-# Talking to MPD's line protocol directly via "nc" sidesteps mpc/
-# libmpdclient (and its negotiation) entirely, so it works regardless of
-# how old Volumio's bundled MPD is.
+# Plain "mpc find"/"mpc search" (no raw-protocol workaround needed here -
+# see the header comment for why volumio-autodj.sh, the cross-machine
+# variant, needs one and this local variant doesn't). "find" first (exact
+# match); if that comes back empty for some other reason, fall back to
+# "search" (case-insensitive substring match) and post-filter its results
+# down to only files whose own artist tag normalizes to exactly the
+# target artist - "search" alone would also match e.g. an unrelated
+# artist whose name merely contains this one as a substring.
 norm_chosen="$(normalize "$chosen_artist")"
 
-mpd_quote() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  printf '"%s"' "$s"
-}
-
-# Sends one command over a fresh MPD connection and prints the raw
-# response. "close" tells MPD to close the connection once it has sent
-# the reply, so "nc" exits on its own instead of needing a fixed wait.
-mpd_raw_query() {
-  printf '%s\nclose\n' "$1" | nc -w 10 "$MPD_HOST" "$MPD_PORT" 2>>"$DEBUG_LOG"
-}
-
-# Parses a find/search response (repeated "file: ..." blocks, each with
-# assorted "Tag: value" lines) and appends the path/title/album of every
-# block whose Artist line normalizes to exactly the target artist, in
-# lockstep (same index across files/titles/albums). The post-filter
-# matters for "search" (substring match) - without it, an unrelated
-# artist whose name merely contains this one as a substring would also
-# match; it's a harmless no-op for "find" (exact match). Title/album are
-# picked up here (instead of a second query later) so the eventual
-# addToQueue call can send real metadata instead of just a bare uri.
 collect_files_by_artist() {
-  local verb="$1" cur_file="" cur_artist="" cur_title="" cur_album="" line
-
-  flush_current() {
-    if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
-      files+=("$cur_file")
-      titles+=("$cur_title")
-      albums+=("$cur_album")
-    fi
-  }
-
-  while IFS= read -r line; do
-    case "$line" in
-      "file: "*)
-        flush_current
-        cur_file="${line#file: }"
-        cur_artist=""
-        cur_title=""
-        cur_album=""
-        ;;
-      "Artist: "*) cur_artist="${line#Artist: }" ;;
-      "Title: "*)  cur_title="${line#Title: }" ;;
-      "Album: "*)  cur_album="${line#Album: }" ;;
-      "ACK "*)
-        log "MPD returned an error for '$verb artist \"$chosen_artist\"': $line"
-        ;;
-    esac
-  done < <(mpd_raw_query "$verb artist $(mpd_quote "$chosen_artist")")
-  flush_current
+  local mpc_cmd="$1" fpath ftitle falbum fartist
+  while IFS=$'\x1f' read -r fpath ftitle falbum fartist; do
+    [[ -z "$fpath" ]] && continue
+    [[ "$(normalize "$fartist")" == "$norm_chosen" ]] || continue
+    files+=("$fpath")
+    titles+=("$ftitle")
+    albums+=("$falbum")
+  done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f $'%file%\x1f%title%\x1f%album%\x1f%artist%' "$mpc_cmd" artist "$chosen_artist" 2>>"$DEBUG_LOG")
 }
 
 files=()
@@ -371,12 +330,12 @@ albums=()
 collect_files_by_artist find
 
 if (( ${#files[@]} == 0 )); then
-  log "MPD 'find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'search' instead"
+  log "'mpc find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'mpc search' instead"
   collect_files_by_artist search
 fi
 
 if (( ${#files[@]} == 0 )); then
-  log "No files found for '$chosen_artist' via 'find' or 'search' - skipping (check $DEBUG_LOG for MPD errors, or try manually: printf 'find artist \"%s\"\\nclose\\n' | nc $MPD_HOST $MPD_PORT)"
+  log "No files found for '$chosen_artist' via 'mpc find' or 'mpc search' - skipping"
   exit 0
 fi
 
