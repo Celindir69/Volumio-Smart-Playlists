@@ -61,6 +61,10 @@ CANDIDATE_LIMIT="${CANDIDATE_LIMIT:-20}"
 # How many recently-used artists to remember for the repeat guard.
 HISTORY_SIZE="${HISTORY_SIZE:-15}"
 
+# How many of the most recent queue entries to consider as a seed pool -
+# see step 2 below. 1 reproduces the old "always the last track" behavior.
+SEED_WINDOW_SIZE="${SEED_WINDOW_SIZE:-5}"
+
 # Same idea as SMART_PLAYLISTS_URI_PREFIXES in volumio-smart-playlists.sh -
 # maps the first path segment MPD reports for a track to the prefix needed
 # to build a Volumio playlist/queue "uri". Kept independent (own env var)
@@ -176,23 +180,50 @@ if (( queue_len == 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Pick a seed artist: the last track currently in the queue.
+# 2. Pick a seed artist: a WEIGHTED RANDOM pick among the last
+#    SEED_WINDOW_SIZE queue entries, most-recent weighted highest, rather
+#    than always the very last track - keeps the similarity chain from
+#    pivoting entirely on a single (possibly odd/atypical) last pick.
+#    SEED_WINDOW_SIZE=1 reproduces the old "always the last track"
+#    behavior exactly.
 # ---------------------------------------------------------------------------
-# NOTE: NOT ".queue[-1]" - negative array indices are a jq 1.5+ feature.
-# jq 1.4 (still the default "apt-get install jq" package on Debian
-# Jessie, which some Volumio images are still based on) silently
-# evaluates ".queue[-1]" to null instead of erroring, so this looked
-# like "the last queue entry has no artist tag" on every single run
-# rather than failing loudly. "queue_len == 0" is already handled above,
-# so the computed index here is always >= 0.
-seed_artist="$(printf '%s' "$queue_json" | jq -r '.queue[(.queue | length) - 1].artist // empty')"
+# Plain "[]" iteration (not ".queue[-N:]" slicing or ".queue[-1]" negative
+# indexing) - both are jq 1.5+ features; jq 1.4 (still the default
+# "apt-get install jq" package on Debian Jessie, which some Volumio images
+# are still based on) doesn't support them. The "last N" window and the
+# weighting are done in bash below instead.
+queue_artists=()
+while IFS= read -r line; do
+  queue_artists+=("$line")
+done < <(printf '%s' "$queue_json" | jq -r '.queue[] | .artist // empty')
 
-if [[ -z "$seed_artist" ]]; then
-  log "Last queue entry has no artist tag - can't pick a seed, nothing to do"
+total_artists=${#queue_artists[@]}
+window=$SEED_WINDOW_SIZE
+(( window > total_artists )) && window=$total_artists
+start=$(( total_artists - window ))
+
+# Build a weighted pool: the oldest entry in the window contributes itself
+# once, the next-more-recent one twice, and so on up to the newest -
+# skipping any entry without an artist tag entirely (its "slot" is simply
+# not represented, rather than diluting the pool with an unusable pick).
+seed_pool=()
+w=1
+for (( i = start; i < total_artists; i++ )); do
+  [[ -z "${queue_artists[$i]}" ]] && continue
+  for (( j = 0; j < w; j++ )); do
+    seed_pool+=("${queue_artists[$i]}")
+  done
+  w=$(( w + 1 ))
+done
+
+if (( ${#seed_pool[@]} == 0 )); then
+  log "None of the last $window queue entries have an artist tag - can't pick a seed, nothing to do"
   exit 0
 fi
 
-log "Seed artist: $seed_artist"
+seed_artist="${seed_pool[$(( RANDOM % ${#seed_pool[@]} ))]}"
+
+log "Seed artist (weighted pick from the last $window queue entries): $seed_artist"
 norm_seed="$(normalize "$seed_artist")"
 history_add "$norm_seed"
 
