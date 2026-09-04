@@ -622,9 +622,13 @@ the small repeat-guard history.
   existing entries, so manual changes you make in the meantime are never
   overwritten.
 - If none of the `CANDIDATE_LIMIT` similar artists for the current seed are
-  in your local library (or all were filtered by the repeat guard), the
-  run simply does nothing that time - it tries again with a (likely
-  different) seed on the next scheduled run once the queue moves on.
+  in your local library, the run simply does nothing that time - it tries
+  again with a (likely different) seed on the next scheduled run once the
+  queue moves on. If candidates ARE in your library but every one of them
+  was filtered by the repeat guard, the repeat guard is overridden as a
+  fallback and the most-similar recently-used artist is picked anyway
+  (still a freshly-randomized track of theirs) - letting playback stop
+  entirely would be worse than an occasional early repeat.
 - The Last.fm similarity graph can drift fairly far from the original
   artist over a long listening session, since each new seed is just "the
   last queued artist" with no anchoring back to where you started. Nothing

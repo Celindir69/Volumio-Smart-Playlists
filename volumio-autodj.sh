@@ -258,8 +258,25 @@ for cand in "${candidates[@]}"; do
   fi
 done
 
+# Nothing survived the repeat guard - rather than let the queue run dry,
+# fall back to the most-similar candidate that's in the local library
+# EVEN IF it was used recently. A repeated artist (picked at random from
+# among their local tracks each time, same as any other pick - see
+# below) is preferable to playback simply stopping once the queue empties.
 if [[ -z "$chosen_artist" ]]; then
-  log "None of the ${#candidates[@]} similar artists for '$seed_artist' are in the local library (or all were filtered by the repeat guard)"
+  for cand in "${candidates[@]}"; do
+    [[ -z "$cand" ]] && continue
+    norm_cand="$(normalize "$cand")"
+    if real_match="$(find_local_artist "$norm_cand")"; then
+      chosen_artist="$real_match"
+      log "No fresh match for '$seed_artist' - falling back to recently-used '$cand' -> '$chosen_artist' rather than leaving the queue to run dry"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$chosen_artist" ]]; then
+  log "None of the ${#candidates[@]} similar artists for '$seed_artist' are in the local library at all"
   exit 0
 fi
 
