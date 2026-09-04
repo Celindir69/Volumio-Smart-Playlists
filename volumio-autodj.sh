@@ -298,36 +298,48 @@ mpd_raw_query() {
 }
 
 # Parses a find/search response (repeated "file: ..." blocks, each with
-# assorted "Tag: value" lines) and appends the path of every block whose
-# Artist line normalizes to exactly the target artist. The post-filter
+# assorted "Tag: value" lines) and appends the path/title/album of every
+# block whose Artist line normalizes to exactly the target artist, in
+# lockstep (same index across files/titles/albums). The post-filter
 # matters for "search" (substring match) - without it, an unrelated
 # artist whose name merely contains this one as a substring would also
-# match; it's a harmless no-op for "find" (exact match).
+# match; it's a harmless no-op for "find" (exact match). Title/album are
+# picked up here (instead of a second query later) so the eventual
+# addToQueue call can send real metadata instead of just a bare uri.
 collect_files_by_artist() {
-  local verb="$1" cur_file="" cur_artist="" line
+  local verb="$1" cur_file="" cur_artist="" cur_title="" cur_album="" line
+
+  flush_current() {
+    if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
+      files+=("$cur_file")
+      titles+=("$cur_title")
+      albums+=("$cur_album")
+    fi
+  }
+
   while IFS= read -r line; do
     case "$line" in
       "file: "*)
-        if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
-          files+=("$cur_file")
-        fi
+        flush_current
         cur_file="${line#file: }"
         cur_artist=""
+        cur_title=""
+        cur_album=""
         ;;
-      "Artist: "*)
-        cur_artist="${line#Artist: }"
-        ;;
+      "Artist: "*) cur_artist="${line#Artist: }" ;;
+      "Title: "*)  cur_title="${line#Title: }" ;;
+      "Album: "*)  cur_album="${line#Album: }" ;;
       "ACK "*)
         log "MPD returned an error for '$verb artist \"$chosen_artist\"': $line"
         ;;
     esac
   done < <(mpd_raw_query "$verb artist $(mpd_quote "$chosen_artist")")
-  if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
-    files+=("$cur_file")
-  fi
+  flush_current
 }
 
 files=()
+titles=()
+albums=()
 collect_files_by_artist find
 
 if (( ${#files[@]} == 0 )); then
@@ -340,7 +352,20 @@ if (( ${#files[@]} == 0 )); then
   exit 0
 fi
 
-picked_file="${files[$(( RANDOM % ${#files[@]} ))]}"
+picked_index=$(( RANDOM % ${#files[@]} ))
+picked_file="${files[$picked_index]}"
+picked_title="${titles[$picked_index]}"
+picked_album="${albums[$picked_index]}"
+
+# Fall back to the bare filename if the file has no Title tag - same
+# fallback the main volumio-smart-playlists.sh script uses.
+if [[ -z "$picked_title" ]]; then
+  picked_title="${picked_file##*/}"
+fi
+
+# Volumio's addToQueue wants a "trackType" (the file format, e.g. "flac"),
+# derived here from the file extension rather than queried separately.
+picked_track_type="$(printf '%s' "${picked_file##*.}" | tr '[:upper:]' '[:lower:]')"
 
 uri=""
 label="${picked_file%%/*}"
@@ -360,9 +385,21 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Append it to Volumio's queue.
 # ---------------------------------------------------------------------------
-add_url="${api_base}/commands/?cmd=addToQueue&uri=$(urlencode "$uri")"
-add_response="$(curl -sf --max-time 10 "$add_url")" || {
-  log "addToQueue request failed for uri '$uri'"
+# NOTE: addToQueue is NOT one of the simple "?cmd=..." GET commands (those
+# only cover playback control like play/pause/next/volume) - it is its own
+# POST endpoint that takes a JSON item, and Volumio requires at least
+# uri/service/title/type/trackType on it (a bare uri, or the ?cmd= form,
+# gets rejected with {"Error":"command not recognized"}).
+add_payload="$(jq -n \
+  --arg uri "$uri" \
+  --arg title "$picked_title" \
+  --arg artist "$chosen_artist" \
+  --arg album "$picked_album" \
+  --arg trackType "$picked_track_type" \
+  '{uri: $uri, service: "mpd", title: $title, artist: $artist, album: $album, type: "song", trackType: $trackType}')"
+
+add_response="$(curl -sf --max-time 10 -X POST -H 'Content-Type: application/json' -d "$add_payload" "${api_base}/addToQueue")" || {
+  log "addToQueue POST request failed for uri '$uri'"
   exit 1
 }
 
