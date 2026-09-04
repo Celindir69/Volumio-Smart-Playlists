@@ -1,0 +1,35 @@
+{
+	"name": "volumio_autodj",
+	"version": "1.0.0",
+	"description": "Continuous play: automatically extends Volumio's play queue with similar tracks from your local library once it's about to run out.",
+	"main": "index.js",
+	"scripts": {
+		"test": "echo \"Error: no test specified\" && exit 1"
+	},
+	"author": "",
+	"license": "MIT",
+	"volumio_info": {
+		"prettyName": "AutoDJ - Continuous Play",
+		"icon": "fa-refresh",
+		"plugin_type": "miscellanea",
+		"boot_priority": 10,
+		"details": "Watches the play queue and, once it's about to run out, appends a track by an artist similar to what's currently playing (via the Last.fm API), matched against your local library."
+	},
+	"engines": {
+		"node": ">=8.11.1",
+		"volumio": ">=3.0.0"
+	},
+	"dependencies": {
+		"fs-extra": "^8.1.0",
+		"kew": "^0.7.0",
+		"v-conf": "^1.4.2"
+	},
+	"repository": "https://github.com/Celindir69/Volumio-Smart-Playlists",
+	"keywords": [
+		"volumio",
+		"autodj",
+		"queue",
+		"lastfm",
+		"continuous play"
+	]
+}

@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# =============================================================================
+# NOTE: this is a bundled copy of ../volumio-autodj-local.sh, invoked by this
+# plugin's index.js on a timer with VOLUMIO_HOST/LASTFM_API_KEY/HISTORY_SIZE
+# set from the plugin's own settings (see saveSettings() and runTick() in
+# index.js). Keep the two files in sync when changing the AutoDJ logic
+# itself; this header block is the only intentional difference.
+# =============================================================================
+# Volumio AutoDJ / Continuous Play - local (SSH) variant
+#
+# For users WHO DO have SSH access to Volumio: runs directly ON Volumio
+# itself, scheduled via cron or a systemd timer there (same pattern as
+# volumio-smart-playlists.sh - see its "Running on a schedule" section in
+# README.md). Watches Volumio's play queue via its REST API; once it's
+# about to run out, picks a similar artist to the last queued track (via
+# the Last.fm API), checks whether that artist is present in the local
+# library (via Volumio's own MPD), and if so appends one random track by
+# that artist to the end of the queue.
+#
+# This is the same idea as volumio-autodj.sh, but simplified for running
+# locally: no "nc"-based raw MPD protocol workaround is needed here. That
+# workaround exists in volumio-autodj.sh because an INDEPENDENTLY installed
+# mpc client (e.g. Homebrew's on macOS) can be a newer version than
+# Volumio's own bundled MPD supports, which breaks "mpc find"/"mpc search"
+# outright. Running Volumio's OWN bundled mpc against its OWN bundled MPD
+# (as this script does) never has that mismatch, so plain "mpc find"/
+# "mpc search" work fine - no "nc" dependency needed. If you don't have
+# SSH access to Volumio, use volumio-autodj.sh from a different device
+# instead.
+#
+# Intended to be run periodically (e.g. every 1-2 minutes) via cron or a
+# systemd timer - it does not loop or schedule itself. Each invocation
+# does at most one queue check and, if needed, adds exactly one track.
+#
+# Simple repeat guard: the last HISTORY_SIZE artists that were added (or
+# used as a seed) are remembered in a small history file, and skipped when
+# picking a candidate, so the same artist isn't immediately re-picked over
+# and over - unless NONE of the current candidates survive the guard, in
+# which case it's overridden as a fallback (see step 4 below) rather than
+# leaving the queue to run dry.
+# =============================================================================
+set -euo pipefail
+
+export LC_ALL=C
+export LANG=C
+
+# ---------------------------------------------------------------------------
+# Configuration (all overridable via environment variables)
+# ---------------------------------------------------------------------------
+# Defaults to localhost since this script is meant to run ON Volumio.
+VOLUMIO_HOST="${VOLUMIO_HOST:-localhost}"
+VOLUMIO_PORT="${VOLUMIO_PORT:-3000}"
+MPD_HOST="${MPD_HOST:-localhost}"
+MPD_PORT="${MPD_PORT:-6600}"
+
+LASTFM_API_KEY="${LASTFM_API_KEY:?Set LASTFM_API_KEY to a free Last.fm API key (https://www.last.fm/api/account/create)}"
+
+# How many tracks may still be left AFTER the currently playing one before
+# a refill is triggered (0 = only refill once the queue is truly empty
+# after the current track).
+QUEUE_LOW_THRESHOLD="${QUEUE_LOW_THRESHOLD:-3}"
+
+# How many similar artists to request from Last.fm per run - the script
+# tries them in order (most similar first) until one is found locally.
+CANDIDATE_LIMIT="${CANDIDATE_LIMIT:-20}"
+
+# How many recently-used artists to remember for the repeat guard.
+HISTORY_SIZE="${HISTORY_SIZE:-15}"
+
+# Same idea as SMART_PLAYLISTS_URI_PREFIXES in volumio-smart-playlists.sh -
+# maps the first path segment MPD reports for a track to the prefix needed
+# to build a Volumio playlist/queue "uri". Kept independent (own env var)
+# so this script's config doesn't collide with the other script's.
+AUTODJ_URI_PREFIXES_DEFAULT="INTERNAL|music-library/
+USB|music-library/
+NAS|mnt/"
+URI_PREFIXES_RAW="${AUTODJ_URI_PREFIXES:-$AUTODJ_URI_PREFIXES_DEFAULT}"
+
+# Deliberately under /data/, matching volumio-smart-playlists.sh's own
+# convention (not tied to the music folder, and not assuming a
+# conventional writable $HOME for whatever user this runs as via cron/
+# systemd).
+WORK_DIR="${AUTODJ_STATE_DIR:-/data/volumio_autodj_data}"
+HISTORY_FILE="$WORK_DIR/history.txt"
+DEBUG_LOG="$WORK_DIR/autodj.debug.log"
+
+mkdir -p "$WORK_DIR"
+
+if [[ -f "$DEBUG_LOG" ]] && (( $(stat -c%s "$DEBUG_LOG" 2>/dev/null || stat -f%z "$DEBUG_LOG" 2>/dev/null || echo 0) > 2097152 )); then
+  mv -f "$DEBUG_LOG" "${DEBUG_LOG}.1"
+fi
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$DEBUG_LOG" >&2
+}
+
+for tool in curl jq mpc; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "Error: '$tool' is required but not found" >&2
+    exit 1
+  fi
+done
+
+normalize() {
+  # NOTE: the "-" must come LAST in the tr -d set below - "tr -d ' -_.'"
+  # would make tr treat "space-underscore" as a RANGE (0x20-0x5F), which
+  # silently deletes digits and punctuation too (e.g. "U2" -> "u",
+  # "3 Doors Down" -> "doorsdown"). Placing "-" last keeps it literal.
+  printf '%s' "$1" \
+    | tr -d '\r' \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/ /g' \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr -d ' _.-'
+}
+
+urlencode() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+# ---------------------------------------------------------------------------
+# Repeat guard: newline-separated, normalized artist names, most recent
+# last, capped at HISTORY_SIZE entries.
+# ---------------------------------------------------------------------------
+history_contains() {
+  local norm_name="$1"
+  [[ -f "$HISTORY_FILE" ]] || return 1
+  grep -qxF "$norm_name" "$HISTORY_FILE"
+}
+
+history_add() {
+  local norm_name="$1"
+  touch "$HISTORY_FILE"
+  # Drop any existing occurrence first so a re-added artist moves to the
+  # end (most-recent) instead of creating a duplicate line.
+  grep -vxF "$norm_name" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp" 2>/dev/null || true
+  mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+  printf '%s\n' "$norm_name" >> "$HISTORY_FILE"
+  # Keep only the last HISTORY_SIZE lines.
+  tail -n "$HISTORY_SIZE" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
+  mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Check Volumio's current playback state and queue.
+# ---------------------------------------------------------------------------
+api_base="http://${VOLUMIO_HOST}:${VOLUMIO_PORT}/api/v1"
+
+state_json="$(curl -sf --max-time 10 "${api_base}/getstate")" || {
+  log "Could not reach Volumio's REST API at $api_base (getstate)"
+  exit 1
+}
+status="$(printf '%s' "$state_json" | jq -r '.status // empty')"
+
+if [[ "$status" != "play" ]]; then
+  log "Volumio status is '$status' (not 'play') - nothing to do"
+  exit 0
+fi
+
+queue_json="$(curl -sf --max-time 10 "${api_base}/getqueue")" || {
+  log "Could not reach Volumio's REST API at $api_base (getqueue)"
+  exit 1
+}
+
+position="$(printf '%s' "$state_json" | jq -r '.position // 0')"
+queue_len="$(printf '%s' "$queue_json" | jq -r '.queue | length')"
+remaining=$(( queue_len - position - 1 ))
+
+log "Queue: $queue_len tracks, position=$position, remaining after current=$remaining (threshold=$QUEUE_LOW_THRESHOLD)"
+
+if (( remaining >= QUEUE_LOW_THRESHOLD )); then
+  log "Enough tracks remaining - nothing to do"
+  exit 0
+fi
+
+if (( queue_len == 0 )); then
+  log "Queue is empty - nothing to seed from, nothing to do"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Pick a seed artist: the last track currently in the queue.
+# ---------------------------------------------------------------------------
+seed_artist="$(printf '%s' "$queue_json" | jq -r '.queue[-1].artist // empty')"
+
+if [[ -z "$seed_artist" ]]; then
+  log "Last queue entry has no artist tag - can't pick a seed, nothing to do"
+  exit 0
+fi
+
+log "Seed artist: $seed_artist"
+norm_seed="$(normalize "$seed_artist")"
+history_add "$norm_seed"
+
+# ---------------------------------------------------------------------------
+# 3. Ask Last.fm for similar artists (most similar first).
+# ---------------------------------------------------------------------------
+lastfm_url="http://ws.audioscrobbler.com/2.0/?method=artist.getsimilar&artist=$(urlencode "$seed_artist")&api_key=${LASTFM_API_KEY}&format=json&limit=${CANDIDATE_LIMIT}"
+lastfm_json="$(curl -sf --max-time 10 "$lastfm_url")" || {
+  log "Last.fm request failed"
+  exit 1
+}
+
+lastfm_error="$(printf '%s' "$lastfm_json" | jq -r '.message // empty')"
+if [[ -n "$lastfm_error" ]]; then
+  log "Last.fm returned an error: $lastfm_error"
+  exit 1
+fi
+
+# "mapfile"/"readarray" and "declare -A" both need bash 4.0+, which isn't a
+# safe assumption on Volumio's own bash across every device/image this
+# might run on - plain "while read" loops and parallel arrays (see
+# find_local_artist below) work on any bash version instead.
+candidates=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  candidates+=("$line")
+done < <(printf '%s' "$lastfm_json" | jq -r '.similarartists.artist[]?.name // empty')
+
+if (( ${#candidates[@]} == 0 )); then
+  log "Last.fm returned no similar artists for '$seed_artist'"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Try each candidate, most similar first, until one is found locally
+#    (via MPD's artist list) and isn't in the repeat-guard history.
+# ---------------------------------------------------------------------------
+local_artists=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  local_artists+=("$line")
+done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" list artist 2>>"$DEBUG_LOG")
+
+if (( ${#local_artists[@]} == 0 )); then
+  log "Could not read the local artist list from MPD ($MPD_HOST:$MPD_PORT) - is it running?"
+  exit 1
+fi
+
+# Parallel arrays instead of "declare -A" - normalized name in
+# local_norm[i] maps to the real, as-tagged name in local_real[i] at the
+# same index.
+local_norm=()
+local_real=()
+for a in "${local_artists[@]}"; do
+  [[ -z "$a" ]] && continue
+  local_norm+=("$(normalize "$a")")
+  local_real+=("$a")
+done
+
+find_local_artist() {
+  local target="$1" i
+  for (( i = 0; i < ${#local_norm[@]}; i++ )); do
+    if [[ "${local_norm[$i]}" == "$target" ]]; then
+      printf '%s' "${local_real[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+chosen_artist=""
+for cand in "${candidates[@]}"; do
+  [[ -z "$cand" ]] && continue
+  norm_cand="$(normalize "$cand")"
+  if history_contains "$norm_cand"; then
+    log "Skipping '$cand' (recently used, repeat guard)"
+    continue
+  fi
+  if real_match="$(find_local_artist "$norm_cand")"; then
+    chosen_artist="$real_match"
+    log "Match found in local library: '$cand' -> '$chosen_artist'"
+    break
+  fi
+done
+
+# Nothing survived the repeat guard - rather than let the queue run dry,
+# fall back to the most-similar candidate that's in the local library
+# EVEN IF it was used recently. A repeated artist (picked at random from
+# among their local tracks each time, same as any other pick - see
+# below) is preferable to playback simply stopping once the queue empties.
+if [[ -z "$chosen_artist" ]]; then
+  for cand in "${candidates[@]}"; do
+    [[ -z "$cand" ]] && continue
+    norm_cand="$(normalize "$cand")"
+    if real_match="$(find_local_artist "$norm_cand")"; then
+      chosen_artist="$real_match"
+      log "No fresh match for '$seed_artist' - falling back to recently-used '$cand' -> '$chosen_artist' rather than leaving the queue to run dry"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$chosen_artist" ]]; then
+  log "None of the ${#candidates[@]} similar artists for '$seed_artist' are in the local library at all"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Pick one random track by that artist and build its Volumio queue uri.
+# ---------------------------------------------------------------------------
+# Plain "mpc find"/"mpc search" (no raw-protocol workaround needed here -
+# see the header comment for why volumio-autodj.sh, the cross-machine
+# variant, needs one and this local variant doesn't). "find" first (exact
+# match); if that comes back empty for some other reason, fall back to
+# "search" (case-insensitive substring match) and post-filter its results
+# down to only files whose own artist tag normalizes to exactly the
+# target artist - "search" alone would also match e.g. an unrelated
+# artist whose name merely contains this one as a substring.
+norm_chosen="$(normalize "$chosen_artist")"
+
+collect_files_by_artist() {
+  local mpc_cmd="$1" fpath ftitle falbum fartist
+  while IFS=$'\x1f' read -r fpath ftitle falbum fartist; do
+    [[ -z "$fpath" ]] && continue
+    [[ "$(normalize "$fartist")" == "$norm_chosen" ]] || continue
+    files+=("$fpath")
+    titles+=("$ftitle")
+    albums+=("$falbum")
+  done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f $'%file%\x1f%title%\x1f%album%\x1f%artist%' "$mpc_cmd" artist "$chosen_artist" 2>>"$DEBUG_LOG")
+}
+
+files=()
+titles=()
+albums=()
+collect_files_by_artist find
+
+if (( ${#files[@]} == 0 )); then
+  log "'mpc find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'mpc search' instead"
+  collect_files_by_artist search
+fi
+
+if (( ${#files[@]} == 0 )); then
+  log "No files found for '$chosen_artist' via 'mpc find' or 'mpc search' - skipping"
+  exit 0
+fi
+
+picked_index=$(( RANDOM % ${#files[@]} ))
+picked_file="${files[$picked_index]}"
+picked_title="${titles[$picked_index]}"
+picked_album="${albums[$picked_index]}"
+
+# Fall back to the bare filename if the file has no Title tag - same
+# fallback the main volumio-smart-playlists.sh script uses.
+if [[ -z "$picked_title" ]]; then
+  picked_title="${picked_file##*/}"
+fi
+
+# Volumio's addToQueue wants a "trackType" (the file format, e.g. "flac"),
+# derived here from the file extension rather than queried separately.
+picked_track_type="$(printf '%s' "${picked_file##*.}" | tr '[:upper:]' '[:lower:]')"
+
+uri=""
+label="${picked_file%%/*}"
+while IFS='|' read -r lbl pfx; do
+  [[ -z "$lbl" ]] && continue
+  if [[ "$lbl" == "$label" ]]; then
+    uri="${pfx}${picked_file}"
+    break
+  fi
+done <<< "$URI_PREFIXES_RAW"
+
+if [[ -z "$uri" ]]; then
+  log "No configured uri prefix for source label '$label' (path: $picked_file) - set AUTODJ_URI_PREFIXES; skipping"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Append it to Volumio's queue.
+# ---------------------------------------------------------------------------
+# NOTE: addToQueue is NOT one of the simple "?cmd=..." GET commands (those
+# only cover playback control like play/pause/next/volume) - it is its own
+# POST endpoint that takes a JSON item, and Volumio requires at least
+# uri/service/title/type/trackType on it (a bare uri, or the ?cmd= form,
+# gets rejected with {"Error":"command not recognized"}).
+add_payload="$(jq -n \
+  --arg uri "$uri" \
+  --arg title "$picked_title" \
+  --arg artist "$chosen_artist" \
+  --arg album "$picked_album" \
+  --arg trackType "$picked_track_type" \
+  '{uri: $uri, service: "mpd", title: $title, artist: $artist, album: $album, type: "song", trackType: $trackType}')"
+
+add_response="$(curl -sf --max-time 10 -X POST -H 'Content-Type: application/json' -d "$add_payload" "${api_base}/addToQueue")" || {
+  log "addToQueue POST request failed for uri '$uri'"
+  exit 1
+}
+
+log "Added '$picked_file' (artist: $chosen_artist) to the queue - response: $add_response"
+history_add "$(normalize "$chosen_artist")"

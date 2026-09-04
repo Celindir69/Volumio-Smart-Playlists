@@ -1,0 +1,61 @@
+{
+	"page": {
+		"label": "AutoDJ Settings"
+	},
+	"sections": [
+		{
+			"id": "section_autodj",
+			"element": "section",
+			"label": "Continuous Play (AutoDJ)",
+			"description": "Automatically extends the play queue with a track by an artist similar to what's currently playing, once the queue is about to run out. Uses the Last.fm API for similarity data and your local library for matching tracks - nothing is added unless the artist is actually in your library.",
+			"icon": "fa-refresh",
+			"onSave": {
+				"type": "controller",
+				"endpoint": "miscellanea/volumio_autodj",
+				"method": "saveSettings"
+			},
+			"saveButton": {
+				"label": "Save",
+				"data": [
+					"enabled",
+					"intervalSeconds",
+					"lastfmApiKey",
+					"historySize"
+				]
+			},
+			"content": [
+				{
+					"id": "enabled",
+					"element": "switch",
+					"label": "Enabled",
+					"description": "Turn continuous play on or off. Requires a Last.fm API key below.",
+					"value": false
+				},
+				{
+					"id": "intervalSeconds",
+					"element": "input",
+					"type": "text",
+					"label": "Check interval (seconds)",
+					"doc": "How often to check the queue and, if needed, add a track. Minimum 30 seconds.",
+					"value": "90"
+				},
+				{
+					"id": "lastfmApiKey",
+					"element": "input",
+					"type": "password",
+					"label": "Last.fm API key",
+					"doc": "Free API key from https://www.last.fm/api/account/create - used to find artists similar to what's currently playing.",
+					"value": ""
+				},
+				{
+					"id": "historySize",
+					"element": "input",
+					"type": "text",
+					"label": "Repeat guard size",
+					"doc": "How many recently-used artists to remember and avoid repeating right away. If none of the similar artists found for the current track are outside this list, the guard is overridden rather than letting the queue run dry.",
+					"value": "15"
+				}
+			]
+		}
+	]
+}

@@ -699,6 +699,42 @@ differences:
    */2 * * * * volumio /usr/local/bin/volumio-autodj-local.sh >> /home/volumio/autodj_cron.log 2>&1
    ```
 
+### Even simpler with SSH access: the AutoDJ plugin (`volumio-autodj-plugin/`)
+
+`volumio-autodj-plugin/` packages `volumio-autodj-local.sh` into an actual
+Volumio plugin with a settings page in the Volumio UI - **On/Off**, check
+**interval**, Last.fm **API key**, and **repeat guard size** - instead of
+managing cron/systemd and environment variables by hand. It still needs
+SSH access for the one-time install (Volumio has no "install from a
+private/local zip" button in the UI), but no SSH - or terminal at all -
+for day-to-day use afterwards: the plugin runs its own internal timer
+(started/stopped right from its settings page), so no cron or systemd
+timer needs to be set up separately.
+
+Under the hood it's a thin wrapper: the plugin's `index.js` handles the
+settings page and scheduling (a plain `setInterval` started/stopped from
+the "Enabled" switch), and on each tick it runs the bundled
+`volumio-autodj-local.sh` (kept in sync with the standalone script in this
+repository's root) with `LASTFM_API_KEY`/`HISTORY_SIZE` from the plugin's
+settings - the actual AutoDJ logic itself isn't reimplemented, so it
+behaves exactly like the tested standalone script.
+
+**Install (via SSH):**
+```bash
+scp -r volumio-autodj-plugin volumio@<volumio-ip>:/home/volumio/
+ssh volumio@<volumio-ip>
+cd /home/volumio/volumio-autodj-plugin
+volumio plugin install
+```
+Then open **Settings → Plugins → Installed Plugins → AutoDJ - Continuous
+Play** in the Volumio UI, enter your Last.fm API key, adjust the interval/
+repeat-guard size if you like, and switch it on.
+
+Plugin logs appear in Volumio's own plugin log (`journalctl -u volumio -f`
+while it's running, or via the Volumio UI's log viewer) - each run's
+output is prefixed `[volumio_autodj]` - in addition to the bundled
+script's own debug log at `/data/volumio_autodj_data/autodj.debug.log`.
+
 ## Upgrading from an earlier version
 
 This script has gone through a few naming/location and architecture
