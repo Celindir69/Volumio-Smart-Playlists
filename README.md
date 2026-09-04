@@ -486,7 +486,14 @@ experience.
 
 **Runs on a different device than Volumio** (a NAS, a Raspberry Pi, a PC -
 anything on the same network), not on Volumio itself, and needs no SSH
-access to Volumio at all - it only talks to Volumio over the network:
+access to Volumio at all - it only talks to Volumio over the network. **If
+you DO have SSH access to Volumio**, use `volumio-autodj-local.sh` instead
+- it runs directly on Volumio itself (scheduled the same way as
+`volumio-smart-playlists.sh`) and is simpler, since it avoids the
+cross-machine compatibility workaround described further below. See "If
+you have SSH access" near the end of this section.
+
+`volumio-autodj.sh` talks to Volumio over the network:
 - Volumio's own REST API (`http://<volumio-ip>:3000/api/v1/...`) to read
   the current queue/playback state and to append tracks.
 - Volumio's MPD instance (`<volumio-ip>:6600`) to check whether a
@@ -651,6 +658,46 @@ the small repeat-guard history.
   that whole class of version-negotiation incompatibility - entirely. The
   simpler `mpc list artist` lookup elsewhere in the script is unaffected
   and still uses `mpc` normally.
+
+### If you have SSH access: run it locally instead (`volumio-autodj-local.sh`)
+
+Everything above describes `volumio-autodj.sh`, which is designed to run
+on a **different** device because it assumes no SSH access to Volumio. If
+you do have SSH access, `volumio-autodj-local.sh` is a simpler alternative
+that runs directly **on** Volumio itself - same behavior and
+configuration variables (`LASTFM_API_KEY`, `QUEUE_LOW_THRESHOLD`,
+`CANDIDATE_LIMIT`, `HISTORY_SIZE`, `AUTODJ_URI_PREFIXES`), with these
+differences:
+
+- `VOLUMIO_HOST`/`MPD_HOST` default to `localhost` instead of being
+  required - no IP/hostname to configure in the common case.
+- No `nc` dependency and no raw-protocol workaround: it uses plain `mpc
+  find`/`mpc search` directly. The version-mismatch problem described
+  above only happens when an *independently installed* mpc talks to
+  Volumio's MPD over the network - Volumio's own bundled `mpc` always
+  matches its own bundled MPD, so that failure mode can't occur here.
+- `AUTODJ_STATE_DIR` defaults to `/data/volumio_autodj_data` instead of
+  `~/.volumio-autodj`, matching where `volumio-smart-playlists.sh` keeps
+  its own state (deliberately under `/data/`, not tied to a particular
+  user's home directory).
+
+**Setup:**
+
+1. Copy `volumio-autodj-local.sh` to Volumio (e.g.
+   `/usr/local/bin/volumio-autodj-local.sh`) and make it executable:
+   `sudo chmod +x /usr/local/bin/volumio-autodj-local.sh`.
+2. Requires `curl`, `jq`, and `mpc` - `mpc` is part of Volumio's base
+   image already; install `jq` if needed (see "Requirements" above).
+3. Get a free Last.fm API key: https://www.last.fm/api/account/create
+4. Schedule it every 1-2 minutes via cron or a systemd timer - see
+   "Running on a schedule" above for the exact steps (cron entry or
+   systemd `.service`/`.timer` files), just pointed at
+   `volumio-autodj-local.sh` and with `LASTFM_API_KEY` set, e.g. as a
+   `PATH`-style variable line above the crontab entry:
+   ```
+   LASTFM_API_KEY=xxxxxxxx
+   */2 * * * * volumio /usr/local/bin/volumio-autodj-local.sh >> /home/volumio/autodj_cron.log 2>&1
+   ```
 
 ## Upgrading from an earlier version
 
