@@ -511,9 +511,14 @@ Each run does at most one check and, if needed, adds exactly one track:
 1. Reads Volumio's current state and queue. Does nothing if playback isn't
    currently `play`, or if the number of tracks left after the current one
    is still at or above `QUEUE_LOW_THRESHOLD`.
-2. Otherwise, takes the **artist of the last track currently in the
-   queue** as the seed and asks Last.fm for similar artists (most similar
-   first).
+2. Otherwise, picks a seed artist via a **weighted random pick among the
+   last `SEED_WINDOW_SIZE` queue entries** (most recent weighted highest -
+   e.g. with the default of 5, the newest contributes 5x as many "tickets"
+   as the oldest of the five) and asks Last.fm for artists similar to it
+   (most similar first). Weighting across a small window instead of always
+   using only the very last track keeps the similarity chain from
+   pivoting entirely on a single, possibly atypical pick - `SEED_WINDOW_SIZE=1`
+   reproduces the old "always the last track" behavior exactly.
 3. Tries each candidate in order until one is found in the local library
    (checked via `mpc list artist`) - and skips any candidate that was used
    too recently (**repeat guard**: a small history file of the last
@@ -615,6 +620,9 @@ the small repeat-guard history.
   tracks remain after the currently playing one.
 - `CANDIDATE_LIMIT` (default `20`) - how many similar artists to request
   from Last.fm per run.
+- `SEED_WINDOW_SIZE` (default `5`) - how many of the most recent queue
+  entries to weight-pick the seed artist from; `1` = always the last
+  track (the old behavior).
 - `HISTORY_SIZE` (default `15`) - how many recently-used artists the
   repeat guard remembers.
 - `AUTODJ_URI_PREFIXES` - same idea/format as `SMART_PLAYLISTS_URI_PREFIXES`
@@ -666,8 +674,8 @@ on a **different** device because it assumes no SSH access to Volumio. If
 you do have SSH access, `volumio-autodj-local.sh` is a simpler alternative
 that runs directly **on** Volumio itself - same behavior and
 configuration variables (`LASTFM_API_KEY`, `QUEUE_LOW_THRESHOLD`,
-`CANDIDATE_LIMIT`, `HISTORY_SIZE`, `AUTODJ_URI_PREFIXES`), with these
-differences:
+`CANDIDATE_LIMIT`, `SEED_WINDOW_SIZE`, `HISTORY_SIZE`,
+`AUTODJ_URI_PREFIXES`), with these differences:
 
 - `VOLUMIO_HOST`/`MPD_HOST` default to `localhost` instead of being
   required - no IP/hostname to configure in the common case.
