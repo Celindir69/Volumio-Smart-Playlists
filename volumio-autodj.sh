@@ -192,7 +192,14 @@ if [[ -n "$lastfm_error" ]]; then
   exit 1
 fi
 
-mapfile -t candidates < <(printf '%s' "$lastfm_json" | jq -r '.similarartists.artist[]?.name // empty')
+# "mapfile"/"readarray" needs bash 4.0+, which isn't a given on every
+# device this script might run on (e.g. macOS still ships bash 3.2 by
+# default) - a plain "while read" loop works on any bash version instead.
+candidates=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  candidates+=("$line")
+done < <(printf '%s' "$lastfm_json" | jq -r '.similarartists.artist[]?.name // empty')
 
 if (( ${#candidates[@]} == 0 )); then
   log "Last.fm returned no similar artists for '$seed_artist'"
@@ -203,18 +210,38 @@ fi
 # 4. Try each candidate, most similar first, until one is found locally
 #    (via MPD's artist list) and isn't in the repeat-guard history.
 # ---------------------------------------------------------------------------
-mapfile -t local_artists < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" list artist 2>>"$DEBUG_LOG")
+local_artists=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  local_artists+=("$line")
+done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" list artist 2>>"$DEBUG_LOG")
 
 if (( ${#local_artists[@]} == 0 )); then
   log "Could not read the local artist list from MPD ($MPD_HOST:$MPD_PORT) - is it reachable? (check bind_to_address in Volumio's mpd.conf)"
   exit 1
 fi
 
-declare -A norm_to_real=()
+# Parallel arrays instead of "declare -A" (associative arrays also need
+# bash 4.0+, same as mapfile above) - normalized name in local_norm[i]
+# maps to the real, as-tagged name in local_real[i] at the same index.
+local_norm=()
+local_real=()
 for a in "${local_artists[@]}"; do
   [[ -z "$a" ]] && continue
-  norm_to_real["$(normalize "$a")"]="$a"
+  local_norm+=("$(normalize "$a")")
+  local_real+=("$a")
 done
+
+find_local_artist() {
+  local target="$1" i
+  for (( i = 0; i < ${#local_norm[@]}; i++ )); do
+    if [[ "${local_norm[$i]}" == "$target" ]]; then
+      printf '%s' "${local_real[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
 
 chosen_artist=""
 for cand in "${candidates[@]}"; do
@@ -224,8 +251,8 @@ for cand in "${candidates[@]}"; do
     log "Skipping '$cand' (recently used, repeat guard)"
     continue
   fi
-  if [[ -n "${norm_to_real[$norm_cand]:-}" ]]; then
-    chosen_artist="${norm_to_real[$norm_cand]}"
+  if real_match="$(find_local_artist "$norm_cand")"; then
+    chosen_artist="$real_match"
     log "Match found in local library: '$cand' -> '$chosen_artist'"
     break
   fi
@@ -239,7 +266,11 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Pick one random track by that artist and build its Volumio queue uri.
 # ---------------------------------------------------------------------------
-mapfile -t files < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f '%file%' find artist "$chosen_artist" 2>>"$DEBUG_LOG")
+files=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  files+=("$line")
+done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f '%file%' find artist "$chosen_artist" 2>>"$DEBUG_LOG")
 
 if (( ${#files[@]} == 0 )); then
   log "No files found for '$chosen_artist' via 'mpc find' despite appearing in 'mpc list artist' - skipping"
