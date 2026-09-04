@@ -166,7 +166,14 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Pick a seed artist: the last track currently in the queue.
 # ---------------------------------------------------------------------------
-seed_artist="$(printf '%s' "$queue_json" | jq -r '.queue[-1].artist // empty')"
+# NOTE: NOT ".queue[-1]" - negative array indices are a jq 1.5+ feature.
+# jq 1.4 (still the default "apt-get install jq" package on Debian
+# Jessie, which some Volumio images are still based on) silently
+# evaluates ".queue[-1]" to null instead of erroring, so this looked
+# like "the last queue entry has no artist tag" on every single run
+# rather than failing loudly. "queue_len == 0" is already handled above,
+# so the computed index here is always >= 0.
+seed_artist="$(printf '%s' "$queue_json" | jq -r '.queue[(.queue | length) - 1].artist // empty')"
 
 if [[ -z "$seed_artist" ]]; then
   log "Last queue entry has no artist tag - can't pick a seed, nothing to do"
