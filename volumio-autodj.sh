@@ -266,14 +266,35 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Pick one random track by that artist and build its Volumio queue uri.
 # ---------------------------------------------------------------------------
+# "find" does an exact tag match, but some MPD/mpc versions apply it more
+# strictly (e.g. case-sensitively) than "list artist" groups its values,
+# which can make an artist that clearly IS in the library (it showed up in
+# "list artist" above) come back empty from "find". If that happens, fall
+# back to "search" (case-insensitive substring match), then filter its
+# results down to only files whose own artist tag normalizes to exactly
+# the artist we're looking for - "search" alone would also match e.g. an
+# unrelated artist whose name merely contains this one as a substring.
+norm_chosen="$(normalize "$chosen_artist")"
+
+collect_files_by_artist() {
+  local mpc_cmd="$1" fpath fartist
+  while IFS=$'\x1f' read -r fpath fartist; do
+    [[ -z "$fpath" ]] && continue
+    [[ "$(normalize "$fartist")" == "$norm_chosen" ]] || continue
+    files+=("$fpath")
+  done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f $'%file%\x1f%artist%' "$mpc_cmd" artist "$chosen_artist" 2>>"$DEBUG_LOG")
+}
+
 files=()
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
-  files+=("$line")
-done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f '%file%' find artist "$chosen_artist" 2>>"$DEBUG_LOG")
+collect_files_by_artist find
 
 if (( ${#files[@]} == 0 )); then
-  log "No files found for '$chosen_artist' via 'mpc find' despite appearing in 'mpc list artist' - skipping"
+  log "'mpc find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'mpc search' instead"
+  collect_files_by_artist search
+fi
+
+if (( ${#files[@]} == 0 )); then
+  log "No files found for '$chosen_artist' via 'mpc find' or 'mpc search' - skipping (try 'mpc -h $MPD_HOST find artist \"$chosen_artist\"' manually to investigate)"
   exit 0
 fi
 
