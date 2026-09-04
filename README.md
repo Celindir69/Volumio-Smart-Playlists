@@ -476,6 +476,100 @@ above for how the `uri` differs between Internal Storage/USB and NAS.
   just 0 tracks from that source. Check `mount | grep cifs` and `dmesg` if
   NAS tracks are unexpectedly missing.
 
+## Continuous play / AutoDJ (`volumio-autodj.sh`)
+
+A separate, optional script that keeps Volumio's **play queue** topped up
+automatically - unlike the main script above, which builds static
+playlists, this one watches live playback and appends one similar track
+once the queue is about to run out, for a radio-like "continuous play"
+experience.
+
+**Runs on a different device than Volumio** (a NAS, a Raspberry Pi, a PC -
+anything on the same network), not on Volumio itself, and needs no SSH
+access to Volumio at all - it only talks to Volumio over the network:
+- Volumio's own REST API (`http://<volumio-ip>:3000/api/v1/...`) to read
+  the current queue/playback state and to append tracks.
+- Volumio's MPD instance (`<volumio-ip>:6600`) to check whether a
+  candidate artist is present in your local library and to pick a track -
+  this is normally already reachable over the LAN by default on Volumio
+  (the same port third-party MPD clients like MPDroid use), no config
+  change needed in the common case.
+- The [Last.fm API](https://www.last.fm/api/account/create) (free API key)
+  for "similar artist" suggestions.
+
+### How it decides what to add
+
+Each run does at most one check and, if needed, adds exactly one track:
+
+1. Reads Volumio's current state and queue. Does nothing if playback isn't
+   currently `play`, or if the number of tracks left after the current one
+   is still at or above `QUEUE_LOW_THRESHOLD`.
+2. Otherwise, takes the **artist of the last track currently in the
+   queue** as the seed and asks Last.fm for similar artists (most similar
+   first).
+3. Tries each candidate in order until one is found in the local library
+   (checked via `mpc list artist`) - and skips any candidate that was used
+   too recently (**repeat guard**: a small history file of the last
+   `HISTORY_SIZE` artists, so the same artist isn't picked again right
+   away).
+4. Picks one random track by the matched artist and appends it to the end
+   of the queue via Volumio's `addToQueue` command.
+
+This is deliberately simple/reactive (one track at a time, re-evaluated on
+every run) rather than planning several tracks ahead - it naturally
+"drifts" the similarity chain over time and needs no extra state beyond
+the small repeat-guard history.
+
+### Setup
+
+1. Copy `volumio-autodj.sh` to the other device (not Volumio) and make it
+   executable: `chmod +x volumio-autodj.sh`.
+2. Requires `curl`, `jq`, and `mpc` on **that** device (not on Volumio -
+   `mpc` here is just the client, talking to Volumio's MPD over the
+   network).
+3. Get a free Last.fm API key: https://www.last.fm/api/account/create
+4. Run it, e.g. every 1-2 minutes via cron or a systemd timer on that
+   device (see "Running on a schedule" above for the general pattern - it
+   applies the same way here, just pointed at `volumio-autodj.sh` on a
+   different machine):
+   ```bash
+   VOLUMIO_HOST=192.168.1.50 LASTFM_API_KEY=xxxxxxxx ./volumio-autodj.sh
+   ```
+
+### Configuration (environment variables)
+
+- `VOLUMIO_HOST` (required) - Volumio's IP/hostname.
+- `LASTFM_API_KEY` (required) - your free Last.fm API key.
+- `VOLUMIO_PORT` (default `3000`)
+- `MPD_HOST` (default: same as `VOLUMIO_HOST`), `MPD_PORT` (default `6600`)
+- `QUEUE_LOW_THRESHOLD` (default `3`) - refill once this few (or fewer)
+  tracks remain after the currently playing one.
+- `CANDIDATE_LIMIT` (default `20`) - how many similar artists to request
+  from Last.fm per run.
+- `HISTORY_SIZE` (default `15`) - how many recently-used artists the
+  repeat guard remembers.
+- `AUTODJ_URI_PREFIXES` - same idea/format as `SMART_PLAYLISTS_URI_PREFIXES`
+  above (own variable, since this script runs on a separate machine).
+  Default: `INTERNAL|music-library/`, `USB|music-library/`, `NAS|mnt/`.
+- `AUTODJ_STATE_DIR` (default `~/.volumio-autodj`) - where the repeat-guard
+  history and debug log are stored, on the device this script runs on.
+
+### Notes / limitations
+
+- Only handles **appending** to the queue - it never removes or reorders
+  existing entries, so manual changes you make in the meantime are never
+  overwritten.
+- If none of the `CANDIDATE_LIMIT` similar artists for the current seed are
+  in your local library (or all were filtered by the repeat guard), the
+  run simply does nothing that time - it tries again with a (likely
+  different) seed on the next scheduled run once the queue moves on.
+- The Last.fm similarity graph can drift fairly far from the original
+  artist over a long listening session, since each new seed is just "the
+  last queued artist" with no anchoring back to where you started. Nothing
+  in this script currently corrects for that.
+- Debug log at `$AUTODJ_STATE_DIR/autodj.debug.log` on the device this
+  script runs on.
+
 ## Upgrading from an earlier version
 
 This script has gone through a few naming/location and architecture
