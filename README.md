@@ -524,9 +524,12 @@ the small repeat-guard history.
 
 1. Copy `volumio-autodj.sh` to the other device (not Volumio) and make it
    executable: `chmod +x volumio-autodj.sh`.
-2. Requires `curl`, `jq`, and `mpc` on **that** device (not on Volumio -
-   `mpc` here is just the client, talking to Volumio's MPD over the
-   network).
+2. Requires `curl`, `jq`, `mpc`, and `nc` (netcat) on **that** device (not
+   on Volumio) - `mpc` is only used for the simple `list artist` lookup;
+   `nc` is used to speak MPD's own line protocol directly for the
+   find/search step (see "Notes / limitations" below for why). `nc` is
+   preinstalled on macOS and most Linux distributions; if missing, install
+   `netcat-openbsd` (or equivalent).
 3. Get a free Last.fm API key: https://www.last.fm/api/account/create
 4. Run it, e.g. every 1-2 minutes via cron or a systemd timer on that
    device (see "Running on a schedule" above for the general pattern - it
@@ -569,6 +572,22 @@ the small repeat-guard history.
   in this script currently corrects for that.
 - Debug log at `$AUTODJ_STATE_DIR/autodj.debug.log` on the device this
   script runs on.
+- **Why `nc` instead of just `mpc find`/`mpc search`**: newer mpc/
+  libmpdclient releases (e.g. the one Homebrew installs on macOS) send a
+  `tagtypes ...` protocol negotiation command before running `find`/
+  `search`, which requires MPD protocol 0.21+. Volumio's own bundled MPD
+  is often older than that and rejects it outright (`MPD error: wrong
+  number of arguments for "tagtypes"`), which makes `mpc find`/`mpc
+  search` fail completely against Volumio - even for an artist that
+  genuinely is in the library - whenever this script runs on a machine
+  with a newer `mpc` than Volumio's MPD supports. (Same class of bug
+  reported here for another MPD-protocol server:
+  https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1002544.) The
+  find/search step therefore talks to MPD's line protocol directly over a
+  raw TCP connection (via `nc`), bypassing mpc/libmpdclient - and with it,
+  that whole class of version-negotiation incompatibility - entirely. The
+  simpler `mpc list artist` lookup elsewhere in the script is unaffected
+  and still uses `mpc` normally.
 
 ## Upgrading from an earlier version
 

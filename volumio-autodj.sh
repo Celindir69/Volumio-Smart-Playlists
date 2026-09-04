@@ -80,7 +80,7 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$DEBUG_LOG" >&2
 }
 
-for tool in curl jq mpc; do
+for tool in curl jq mpc nc; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "Error: '$tool' is required but not found" >&2
     exit 1
@@ -266,35 +266,77 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Pick one random track by that artist and build its Volumio queue uri.
 # ---------------------------------------------------------------------------
-# "find" does an exact tag match, but some MPD/mpc versions apply it more
-# strictly (e.g. case-sensitively) than "list artist" groups its values,
-# which can make an artist that clearly IS in the library (it showed up in
-# "list artist" above) come back empty from "find". If that happens, fall
-# back to "search" (case-insensitive substring match), then filter its
-# results down to only files whose own artist tag normalizes to exactly
-# the artist we're looking for - "search" alone would also match e.g. an
-# unrelated artist whose name merely contains this one as a substring.
+# NOTE: this deliberately does NOT use "mpc find"/"mpc search". Newer mpc/
+# libmpdclient releases (e.g. Homebrew's on macOS) send a "tagtypes ..."
+# protocol negotiation command before running find/search, which requires
+# MPD protocol 0.21+ - Volumio's own (much older, heavily patched) bundled
+# MPD rejects it outright ("MPD error: wrong number of arguments for
+# 'tagtypes'"), so "mpc find"/"mpc search" fail completely against Volumio
+# whenever this script runs on a machine with a newer mpc than Volumio's
+# MPD supports, even for an artist that unmistakably IS in the library
+# (confirmed via "mpc list artist" just above). Same class of bug reported
+# here for another MPD-protocol server:
+# https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1002544
+#
+# Talking to MPD's line protocol directly via "nc" sidesteps mpc/
+# libmpdclient (and its negotiation) entirely, so it works regardless of
+# how old Volumio's bundled MPD is.
 norm_chosen="$(normalize "$chosen_artist")"
 
+mpd_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# Sends one command over a fresh MPD connection and prints the raw
+# response. "close" tells MPD to close the connection once it has sent
+# the reply, so "nc" exits on its own instead of needing a fixed wait.
+mpd_raw_query() {
+  printf '%s\nclose\n' "$1" | nc -w 10 "$MPD_HOST" "$MPD_PORT" 2>>"$DEBUG_LOG"
+}
+
+# Parses a find/search response (repeated "file: ..." blocks, each with
+# assorted "Tag: value" lines) and appends the path of every block whose
+# Artist line normalizes to exactly the target artist. The post-filter
+# matters for "search" (substring match) - without it, an unrelated
+# artist whose name merely contains this one as a substring would also
+# match; it's a harmless no-op for "find" (exact match).
 collect_files_by_artist() {
-  local mpc_cmd="$1" fpath fartist
-  while IFS=$'\x1f' read -r fpath fartist; do
-    [[ -z "$fpath" ]] && continue
-    [[ "$(normalize "$fartist")" == "$norm_chosen" ]] || continue
-    files+=("$fpath")
-  done < <(mpc -h "$MPD_HOST" -p "$MPD_PORT" -f $'%file%\x1f%artist%' "$mpc_cmd" artist "$chosen_artist" 2>>"$DEBUG_LOG")
+  local verb="$1" cur_file="" cur_artist="" line
+  while IFS= read -r line; do
+    case "$line" in
+      "file: "*)
+        if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
+          files+=("$cur_file")
+        fi
+        cur_file="${line#file: }"
+        cur_artist=""
+        ;;
+      "Artist: "*)
+        cur_artist="${line#Artist: }"
+        ;;
+      "ACK "*)
+        log "MPD returned an error for '$verb artist \"$chosen_artist\"': $line"
+        ;;
+    esac
+  done < <(mpd_raw_query "$verb artist $(mpd_quote "$chosen_artist")")
+  if [[ -n "$cur_file" && "$(normalize "$cur_artist")" == "$norm_chosen" ]]; then
+    files+=("$cur_file")
+  fi
 }
 
 files=()
 collect_files_by_artist find
 
 if (( ${#files[@]} == 0 )); then
-  log "'mpc find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'mpc search' instead"
+  log "MPD 'find artist \"$chosen_artist\"' returned nothing despite appearing in 'mpc list artist' - retrying with 'search' instead"
   collect_files_by_artist search
 fi
 
 if (( ${#files[@]} == 0 )); then
-  log "No files found for '$chosen_artist' via 'mpc find' or 'mpc search' - skipping (try 'mpc -h $MPD_HOST find artist \"$chosen_artist\"' manually to investigate)"
+  log "No files found for '$chosen_artist' via 'find' or 'search' - skipping (check $DEBUG_LOG for MPD errors, or try manually: printf 'find artist \"%s\"\\nclose\\n' | nc $MPD_HOST $MPD_PORT)"
   exit 0
 fi
 
