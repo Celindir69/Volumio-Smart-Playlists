@@ -531,13 +531,72 @@ the small repeat-guard history.
    preinstalled on macOS and most Linux distributions; if missing, install
    `netcat-openbsd` (or equivalent).
 3. Get a free Last.fm API key: https://www.last.fm/api/account/create
-4. Run it, e.g. every 1-2 minutes via cron or a systemd timer on that
-   device (see "Running on a schedule" above for the general pattern - it
-   applies the same way here, just pointed at `volumio-autodj.sh` on a
-   different machine):
+4. Run it periodically, e.g. every 1-2 minutes, via whatever scheduler the
+   device it runs on has. Manual test run:
    ```bash
    VOLUMIO_HOST=192.168.1.50 LASTFM_API_KEY=xxxxxxxx ./volumio-autodj.sh
    ```
+   - **Linux**: cron or a systemd timer - see "Running on a schedule"
+     above for the general pattern (it applies the same way here, just
+     pointed at `volumio-autodj.sh` on a different machine).
+   - **macOS**: a `launchd` LaunchAgent. Save the following as
+     `~/Library/LaunchAgents/com.volumio.autodj.plist` (adjust the paths,
+     `VOLUMIO_HOST`, and `LASTFM_API_KEY` - `PATH` includes both
+     Homebrew locations since launchd's own default `PATH` doesn't
+     include Homebrew's `bin`, which is where `mpc`/`jq` normally live if
+     installed via `brew install mpc jq`):
+     ```xml
+     <?xml version="1.0" encoding="UTF-8"?>
+     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+     <plist version="1.0">
+     <dict>
+         <key>Label</key>
+         <string>com.volumio.autodj</string>
+
+         <key>ProgramArguments</key>
+         <array>
+             <string>/bin/bash</string>
+             <string>/Users/YOURUSERNAME/bin/volumio-autodj.sh</string>
+         </array>
+
+         <key>EnvironmentVariables</key>
+         <dict>
+             <key>PATH</key>
+             <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+             <key>VOLUMIO_HOST</key>
+             <string>192.168.1.50</string>
+             <key>LASTFM_API_KEY</key>
+             <string>xxxxxxxx</string>
+         </dict>
+
+         <key>StartInterval</key>
+         <integer>90</integer>
+
+         <key>RunAtLoad</key>
+         <true/>
+
+         <key>StandardOutPath</key>
+         <string>/Users/YOURUSERNAME/Library/Logs/volumio-autodj.out.log</string>
+
+         <key>StandardErrorPath</key>
+         <string>/Users/YOURUSERNAME/Library/Logs/volumio-autodj.err.log</string>
+     </dict>
+     </plist>
+     ```
+     Then load it:
+     ```bash
+     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.volumio.autodj.plist
+     ```
+     (On very old macOS versions where `bootstrap` isn't available, use
+     `launchctl load -w ~/Library/LaunchAgents/com.volumio.autodj.plist`
+     instead.) Check it's registered with
+     `launchctl list | grep com.volumio.autodj`, and after editing the
+     plist, unload (`launchctl bootout gui/$(id -u) ...` or
+     `launchctl unload ...`) and load it again to pick up the change.
+     `StartInterval` (seconds) is independent of - and typically shorter
+     than - `QUEUE_LOW_THRESHOLD`'s own timing logic further below; the
+     script itself decides on every run whether there's actually anything
+     to do.
 
 ### Configuration (environment variables)
 
@@ -563,9 +622,13 @@ the small repeat-guard history.
   existing entries, so manual changes you make in the meantime are never
   overwritten.
 - If none of the `CANDIDATE_LIMIT` similar artists for the current seed are
-  in your local library (or all were filtered by the repeat guard), the
-  run simply does nothing that time - it tries again with a (likely
-  different) seed on the next scheduled run once the queue moves on.
+  in your local library, the run simply does nothing that time - it tries
+  again with a (likely different) seed on the next scheduled run once the
+  queue moves on. If candidates ARE in your library but every one of them
+  was filtered by the repeat guard, the repeat guard is overridden as a
+  fallback and the most-similar recently-used artist is picked anyway
+  (still a freshly-randomized track of theirs) - letting playback stop
+  entirely would be worse than an occasional early repeat.
 - The Last.fm similarity graph can drift fairly far from the original
   artist over a long listening session, since each new seed is just "the
   last queued artist" with no anchoring back to where you started. Nothing
