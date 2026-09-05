@@ -640,14 +640,27 @@ the small repeat-guard history.
   in your local library, the run simply does nothing that time - it tries
   again with a (likely different) seed on the next scheduled run once the
   queue moves on. If candidates ARE in your library but every one of them
-  was filtered by the repeat guard, the repeat guard is overridden as a
-  fallback and the most-similar recently-used artist is picked anyway
-  (still a freshly-randomized track of theirs) - letting playback stop
-  entirely would be worse than an occasional early repeat.
-- The Last.fm similarity graph can drift fairly far from the original
-  artist over a long listening session, since each new seed is just "the
-  last queued artist" with no anchoring back to where you started. Nothing
-  in this script currently corrects for that.
+  was filtered by the repeat guard, the guard is overridden as a fallback
+  and the **least-recently-used** of the eligible candidates is picked
+  anyway (still a freshly-randomized track of theirs) - letting playback
+  stop entirely would be worse than an occasional early repeat.
+  Deliberately not the *most similar* eligible candidate here: two
+  artists that mutually rank as each other's closest Last.fm match would
+  otherwise ping-pong forever once both are "recently used" - each run's
+  seed becomes whichever one was just added, and its own top fallback is
+  the other one. Picking the least-recently-used one instead rotates
+  through more of a genre clique rather than bouncing between just two
+  artists.
+- The repeat-guard history is reset automatically when the queue looks
+  like a freshly-started session (position 0, only a single track) -
+  otherwise artists from a completely different previous listening
+  session would block otherwise-fresh candidates for the new one, and/or
+  feed straight into the ping-pong situation above.
+- The Last.fm similarity graph can still drift fairly far from where you
+  started over a long listening session, since `SEED_WINDOW_SIZE` only
+  weights toward the last few queued artists, with no anchoring back to
+  the artist you actually started with. Nothing in this script currently
+  corrects for that.
 - Debug log at `$AUTODJ_STATE_DIR/autodj.debug.log` on the device this
   script runs on.
 - **Why `nc` instead of just `mpc find`/`mpc search`**: newer mpc/
