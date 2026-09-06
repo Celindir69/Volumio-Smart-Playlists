@@ -84,8 +84,18 @@ DEBUG_LOG="$WORK_DIR/autodj.debug.log"
 
 mkdir -p "$WORK_DIR"
 
+# NOT "mv" - on some devices (seen in practice: an overlay-root Volumio
+# image where /data/... files get individually tracked as their own
+# overlay mount once "copied up" into the writable layer), renaming OVER
+# an existing file fails with "Device or resource busy". Copy the old
+# content aside, then truncate the original in place instead - avoids
+# rename() entirely. This one is NOT wrapped in "|| ..." on purpose: it
+# runs before log() is even defined, so there's nowhere to log a failure
+# to yet - but cp/truncate failing here would previously have been just
+# as fatal via "mv", so this is strictly safer than before either way.
 if [[ -f "$DEBUG_LOG" ]] && (( $(stat -c%s "$DEBUG_LOG" 2>/dev/null || stat -f%z "$DEBUG_LOG" 2>/dev/null || echo 0) > 2097152 )); then
-  mv -f "$DEBUG_LOG" "${DEBUG_LOG}.1"
+  cp -f "$DEBUG_LOG" "${DEBUG_LOG}.1" 2>/dev/null || true
+  : > "$DEBUG_LOG" 2>/dev/null || true
 fi
 
 log() {
@@ -154,15 +164,25 @@ history_contains() {
 
 history_add() {
   local norm_name="$1"
-  touch "$HISTORY_FILE"
-  # Drop any existing occurrence first so a re-added artist moves to the
-  # end (most-recent) instead of creating a duplicate line.
-  grep -vxF "$norm_name" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp" 2>/dev/null || true
-  mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
-  printf '%s\n' "$norm_name" >> "$HISTORY_FILE"
-  # Keep only the last HISTORY_SIZE lines.
-  tail -n "$HISTORY_SIZE" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp"
-  mv "${HISTORY_FILE}.tmp" "$HISTORY_FILE"
+  touch "$HISTORY_FILE" 2>>"$DEBUG_LOG" || log "Warning: could not touch history file '$HISTORY_FILE'"
+  # Written in ONE pass, in place (not via a temp file + "mv") - on some
+  # devices (seen in practice: an overlay-root Volumio image where
+  # /data/... files get individually tracked as their own overlay mount
+  # once "copied up" into the writable layer), renaming OVER an existing
+  # file fails with "Device or resource busy". That "mv" was an unguarded
+  # command, so under "set -e" it silently killed the ENTIRE script right
+  # here on every single run - invisible under cron, since cron's stderr
+  # is normally redirected away, with nothing further ever getting
+  # logged. Deduplicates (drop any existing occurrence of this artist so
+  # it moves to the end instead of appearing twice), appends the new
+  # entry, and trims to HISTORY_SIZE, all before ever touching the real
+  # file - then writes the result with "cat > file" (truncate + write to
+  # the existing inode, no rename() involved at all).
+  { grep -vxF "$norm_name" "$HISTORY_FILE" 2>/dev/null || true; printf '%s\n' "$norm_name"; } \
+    | tail -n "$HISTORY_SIZE" > "${HISTORY_FILE}.tmp" 2>>"$DEBUG_LOG"
+  cat "${HISTORY_FILE}.tmp" > "$HISTORY_FILE" 2>>"$DEBUG_LOG" || log "Warning: could not write history file '$HISTORY_FILE' - repeat guard may not persist this run"
+  rm -f "${HISTORY_FILE}.tmp"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
