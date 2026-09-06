@@ -119,6 +119,29 @@ urlencode() {
   jq -r -n --arg v "$1" '$v | @uri'
 }
 
+# Runs a jq filter against JSON from an external API (Volumio's REST API or
+# Last.fm) and prints the result, falling back to $2 (and logging the raw
+# response for diagnosis) if the input can't even be parsed as JSON. A
+# PLAIN "var=\"\$(... | jq ...)\"" assignment does NOT degrade gracefully
+# here: if jq fails to parse its input (e.g. a transient non-JSON error
+# page from Last.fm, a truncated response), the whole script dies right
+# there under "set -e" - no log line, no indication why - since a failing
+# command substitution used directly as an assignment's value is NOT one
+# of the "set -e" exemptions. (By contrast, "done < <(... | jq ...)" used
+# elsewhere in this script for building arrays is naturally safe already -
+# a process substitution's own exit status doesn't trigger errexit - so
+# this wrapper is only needed for single-value extractions like this.)
+jq_safe() {
+  local filter="$1" default="$2" json="$3" result
+  if result="$(printf '%s' "$json" | jq -r "$filter" 2>>"$DEBUG_LOG")"; then
+    printf '%s' "$result"
+  else
+    log "Warning: failed to parse a JSON response (jq filter: $filter) - falling back to '$default'. Raw response below."
+    printf '%s\n' "$json" >> "$DEBUG_LOG"
+    printf '%s' "$default"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Repeat guard: newline-separated, normalized artist names, most recent
 # last, capped at HISTORY_SIZE entries.
@@ -151,7 +174,7 @@ state_json="$(curl -sf --max-time 10 "${api_base}/getstate")" || {
   log "Could not reach Volumio's REST API at $api_base (getstate)"
   exit 1
 }
-status="$(printf '%s' "$state_json" | jq -r '.status // empty')"
+status="$(jq_safe '.status // empty' '' "$state_json")"
 
 if [[ "$status" != "play" ]]; then
   log "Volumio status is '$status' (not 'play') - nothing to do"
@@ -163,8 +186,8 @@ queue_json="$(curl -sf --max-time 10 "${api_base}/getqueue")" || {
   exit 1
 }
 
-position="$(printf '%s' "$state_json" | jq -r '.position // 0')"
-queue_len="$(printf '%s' "$queue_json" | jq -r '.queue | length')"
+position="$(jq_safe '.position // 0' '0' "$state_json")"
+queue_len="$(jq_safe '.queue | length' '0' "$queue_json")"
 remaining=$(( queue_len - position - 1 ))
 
 log "Queue: $queue_len tracks, position=$position, remaining after current=$remaining (threshold=$QUEUE_LOW_THRESHOLD)"
@@ -246,7 +269,7 @@ lastfm_json="$(curl -sf --max-time 10 "$lastfm_url")" || {
   exit 1
 }
 
-lastfm_error="$(printf '%s' "$lastfm_json" | jq -r '.message // empty')"
+lastfm_error="$(jq_safe '.message // empty' '' "$lastfm_json")"
 if [[ -n "$lastfm_error" ]]; then
   log "Last.fm returned an error: $lastfm_error"
   exit 1
