@@ -175,6 +175,16 @@ remaining=$(( queue_len - position - 1 ))
 
 log "Queue: $queue_len tracks, position=$position, remaining after current=$remaining (threshold=$QUEUE_LOW_THRESHOLD)"
 
+# Position 0 with only a single track is a strong signal the user just
+# started something completely new (e.g. "play" on one item, replacing
+# whatever was queued before) - reset the repeat-guard history in that
+# case so leftover artists from an entirely different previous listening
+# session don't block otherwise-fresh candidates for this new one.
+if (( position == 0 && queue_len <= 1 )) && [[ -s "$HISTORY_FILE" ]]; then
+  log "Fresh queue detected (position=0, $queue_len track(s)) - resetting repeat-guard history from the previous session"
+  : > "$HISTORY_FILE"
+fi
+
 if (( remaining >= QUEUE_LOW_THRESHOLD )); then
   log "Enough tracks remaining - nothing to do"
   exit 0
@@ -316,20 +326,39 @@ for cand in "${candidates[@]}"; do
 done
 
 # Nothing survived the repeat guard - rather than let the queue run dry,
-# fall back to the most-similar candidate that's in the local library
-# EVEN IF it was used recently. A repeated artist (picked at random from
-# among their local tracks each time, same as any other pick - see
-# below) is preferable to playback simply stopping once the queue empties.
+# fall back to whichever eligible candidate was used LEAST RECENTLY
+# (earliest line in the history file) instead of simply the most similar
+# one. Falling back to "most similar" would otherwise let two artists
+# that mutually rank as each other's closest Last.fm match ping-pong
+# forever: each run's seed becomes whichever one was just added, and its
+# own most-similar fallback is the other one - bouncing between just the
+# two of them instead of ever moving on. A repeated artist (picked at
+# random from among their local tracks each time, same as any other pick
+# - see below) is still preferable to playback simply stopping.
 if [[ -z "$chosen_artist" ]]; then
+  fallback_artist=""
+  fallback_cand_name=""
+  fallback_line=999999999
   for cand in "${candidates[@]}"; do
     [[ -z "$cand" ]] && continue
     norm_cand="$(normalize "$cand")"
     if real_match="$(find_local_artist "$norm_cand")"; then
-      chosen_artist="$real_match"
-      log "No fresh match for '$seed_artist' - falling back to recently-used '$cand' -> '$chosen_artist' rather than leaving the queue to run dry"
-      break
+      # "|| true": under "set -e", grep finding no match (exit 1) would
+      # otherwise abort the whole script right here instead of just
+      # leaving line_no empty for the "not in history at all" case below.
+      line_no="$(grep -nxF "$norm_cand" "$HISTORY_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+      [[ -z "$line_no" ]] && line_no=0
+      if (( line_no < fallback_line )); then
+        fallback_line=$line_no
+        fallback_artist="$real_match"
+        fallback_cand_name="$cand"
+      fi
     fi
   done
+  if [[ -n "$fallback_artist" ]]; then
+    chosen_artist="$fallback_artist"
+    log "No fresh match for '$seed_artist' - falling back to least-recently-used '$fallback_cand_name' -> '$chosen_artist' rather than leaving the queue to run dry"
+  fi
 fi
 
 if [[ -z "$chosen_artist" ]]; then
