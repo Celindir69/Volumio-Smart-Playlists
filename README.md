@@ -12,7 +12,7 @@ compilations into their own playlist).
 Tested with a ~25,000 track FLAC/MP3/M4A/DSF/OGG library spread across
 Internal Storage, a USB drive, and a NAS share on Volumio 3.
 
-Also available as a Volumio plugin (settings page in the Volumio UI, no
+Also available as a Volumio plugin for Volumio 3 and above (settings page in the Volumio UI, no
 SSH needed for day-to-day use) - see
 [smart-playlist-plugin](https://github.com/Celindir69/smart-playlist-plugin),
 which wraps this exact same script.
