@@ -1,6 +1,6 @@
 # Volumio Smart Playlists
 
-A bash script for Volumio 3 that automatically builds native Volumio
+A bash script for Volumio 2 and above that automatically builds native Volumio
 playlists from a plain text file of rules - artist lists with optional
 AND/OR filters on album, genre, year, originalyear, title, artist,
 albumartist, comment, track number, duration, and days-since-added, plus
