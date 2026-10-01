@@ -9,6 +9,8 @@ compilation and the original studio album are both in your library), and
 optional various-artists matching (for pulling an artist's appearances on
 compilations into their own playlist).
 
+Developed using AI (Claude code https://claude.ai)
+
 Tested with a ~25,000 track FLAC/MP3/M4A/DSF/OGG library spread across
 Internal Storage, a USB drive, and a NAS share on Volumio 3.
 
