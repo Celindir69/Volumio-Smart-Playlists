@@ -26,10 +26,12 @@ port 3000. Nothing here has been tested on the device; it is a recipe to try, no
 
 ## Steps
 
-### 1. Build on another computer (Node 20 or newer)
+### 1. Build on a normal computer (Node 20.19 or newer, or Node 22)
 
-The player's Node is too old to build. The address of the player, with port 3000, is baked in at
-build time:
+Do not build on a Volumio player: its Node is too old (this build needs Node `^20.19.0 || >=22.12.0`,
+Vite 8) and `npm ci` needs several hundred MB, which a player's small system partition does not
+have (`ENOSPC: no space left on device`). The address of the MX-Stream, with port 3000, is baked in
+at build time:
 
 ```bash
 git clone https://github.com/michaltamas/volumio-artwork-one.git
@@ -40,6 +42,16 @@ VITE_VOLUMIO_HOST=http://mxstream.local:3000 npm run build
 
 Use the player's IP address instead of `mxstream.local` if the name does not resolve everywhere.
 The result is the `dist/` folder.
+
+Without a suitable Node on the computer, Docker works too (run it inside the cloned folder):
+
+```bash
+docker run --rm -v "$PWD":/app -w /app -e VITE_VOLUMIO_HOST=http://mxstream.local:3000 \
+  node:22 sh -c "npm ci && npm run build"
+```
+
+The release archive of Artwork One cannot be used for this: it is built without a player address
+and would talk to the server on port 8080 instead of the player.
 
 ### 2. Copy the build to the player
 
